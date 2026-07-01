@@ -47,13 +47,13 @@ def compress_image(file, max_side: int = 1600, quality: int = 82) -> tuple[bytes
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue(), img.width, img.height
 
-def upload_to_cloudinary(image_bytes, filename, branch_folder):
+def upload_to_cloudinary(image_bytes, filename):
     """
-    อัพโหลดขึ้น Cloudinary โดยเก็บในโฟลเดอร์ branch/<ชื่อสาขา>
+    อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
     """
     result = cloudinary.uploader.upload(
         image_bytes,
-        folder=f"branch/{branch_folder}",
+        folder="branch",
         public_id=filename,
         resource_type="image",
         overwrite=False,
@@ -98,10 +98,7 @@ if uploaded_files:
         with cols[i % 3]:
             st.image(f, caption=f.name, use_container_width=True)
 
-    if sender_name.strip():
-        st.info(f"จะบันทึกในโฟลเดอร์ branch/{sender_name.strip()} ทั้ง {len(uploaded_files)} รูป")
-    else:
-        st.info(f"จะบันทึกในโฟลเดอร์ branch/<ชื่อสาขา> ทั้ง {len(uploaded_files)} รูป")
+    st.info(f"จะบันทึกในโฟลเดอร์ branch ทั้ง {len(uploaded_files)} รูป")
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
     if st.button(f"☁️ อัพโหลดทั้งหมด ({len(uploaded_files)} รูป)"):
@@ -119,7 +116,7 @@ if uploaded_files:
 
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     fname = f"{safe_sender}_{ts}_{idx+1}"
-                    upload_to_cloudinary(img_bytes, fname, safe_sender)
+                    upload_to_cloudinary(img_bytes, fname)
                     results.append({
                         "filename": fname,
                         "ok": True,
