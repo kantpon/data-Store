@@ -31,6 +31,12 @@ def setup_cloudinary():
         secure=True
     )
 
+def fix_orientation(file):
+    """เปิดรูปแล้วหมุนตาม EXIF ให้ถูกทาง คืนเป็น PIL Image สำหรับใช้แสดงพรีวิว"""
+    img = Image.open(file)
+    img = ImageOps.exif_transpose(img)
+    return img
+
 def compress_image(file, max_side: int = 1600, quality: int = 82) -> tuple[bytes, int, int]:
     """
     ลดขนาดรูปให้ด้านยาวไม่เกิน max_side px แล้ว compress เป็น JPEG
@@ -97,7 +103,8 @@ if uploaded_files:
     cols = st.columns(3)
     for i, f in enumerate(uploaded_files):
         with cols[i % 3]:
-            st.image(f, caption=f.name, use_container_width=True)
+            preview_img = fix_orientation(f)
+            st.image(preview_img, caption=f.name, use_container_width=True)
 
     st.info(f"จะบันทึกในโฟลเดอร์ branch ทั้ง {len(uploaded_files)} รูป")
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -113,6 +120,7 @@ if uploaded_files:
             for idx, f in enumerate(uploaded_files):
                 try:
                     # ── compress: max 1600px ด้านยาว, quality 82 ──
+                    f.seek(0)  # รีเซ็ตตำแหน่งไฟล์ เพราะพรีวิวด้านบนอ่านไปแล้ว
                     img_bytes, new_w, new_h = compress_image(f, max_side=1600, quality=82)
 
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
