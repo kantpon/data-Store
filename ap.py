@@ -87,6 +87,21 @@ st.markdown("#### Zone")
 zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed")
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 📦 สถานะการเก็บบิล")
+completeness = st.selectbox(
+    "สถานะการเก็บบิล",
+    ["-- กรุณาเลือก --", "ครบ", "ไม่ครบ"],
+    label_visibility="collapsed",
+)
+
+incomplete_reason = ""
+if completeness == "ไม่ครบ":
+    incomplete_reason = st.text_input(
+        "เหตุผลที่เก็บไม่ครบ",
+        placeholder="เช่น เครื่องเสีย, เครื่องไม่เปิด, อื่นๆ",
+    )
+
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 📷 เลือกรูปภาพ (เลือกได้หลายรูปพร้อมกัน)")
 st.caption("💡 กด Ctrl ค้างไว้แล้วคลิกเลือกหลายรูปพร้อมกัน")
 
@@ -111,8 +126,19 @@ if uploaded_files:
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
     if st.button(f"☁️ อัพโหลดทั้งหมด ({len(uploaded_files)} รูป)"):
+        missing = []
         if not sender_name.strip():
-            st.markdown('<div class="error-box">⚠️ กรุณากรอกชื่อผู้ส่งก่อนอัพโหลด</div>', unsafe_allow_html=True)
+            missing.append("ชื่อสาขาCJ")
+        if not zone.strip():
+            missing.append("Zone")
+        if completeness == "-- กรุณาเลือก --":
+            missing.append("เก็บบิลครบไหม")
+        if completeness == "ไม่ครบ" and not incomplete_reason.strip():
+            missing.append("เหตุผลที่เก็บไม่ครบ")
+
+        if missing:
+            items = "".join([f"<br>• {m}" for m in missing])
+            st.markdown(f'<div class="error-box">⚠️ กรุณากรอกข้อมูลให้ครบก่อนอัพโหลด:{items}</div>', unsafe_allow_html=True)
         else:
             safe_sender = sender_name.strip().replace("/", "-").replace("\\", "-")
             results = []
