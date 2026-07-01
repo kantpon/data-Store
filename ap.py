@@ -31,13 +31,14 @@ def setup_cloudinary():
         secure=True
     )
 
-def fix_orientation(file):
-    """เปิดรูปแล้วหมุนตาม EXIF ให้ถูกทาง คืนเป็น PIL Image สำหรับใช้แสดงพรีวิว"""
+def fix_orientation(file, thumb_side: int = 500):
+    """เปิดรูป หมุนตาม EXIF ให้ถูกทาง แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
     img = Image.open(file)
     img = ImageOps.exif_transpose(img)
+    img.thumbnail((thumb_side, thumb_side), Image.LANCZOS)
     return img
 
-def compress_image(file, max_side: int = 1600, quality: int = 82) -> tuple[bytes, int, int]:
+def compress_image(file, max_side: int = 1280, quality: int = 78) -> tuple[bytes, int, int]:
     """
     ลดขนาดรูปให้ด้านยาวไม่เกิน max_side px แล้ว compress เป็น JPEG
     คืน (bytes, new_width, new_height)
@@ -121,7 +122,7 @@ if uploaded_files:
                 try:
                     # ── compress: max 1600px ด้านยาว, quality 82 ──
                     f.seek(0)  # รีเซ็ตตำแหน่งไฟล์ เพราะพรีวิวด้านบนอ่านไปแล้ว
-                    img_bytes, new_w, new_h = compress_image(f, max_side=1600, quality=82)
+                    img_bytes, new_w, new_h = compress_image(f, max_side=1280, quality=78)
 
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     fname = f"{safe_sender}_{ts}_{idx+1}"
