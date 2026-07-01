@@ -3,7 +3,7 @@ import cloudinary
 import cloudinary.uploader
 import io
 import datetime
-from PIL import Image
+from PIL import Image, ImageOps
 
 st.set_page_config(page_title="อัพโหลดใบเสร็จ", page_icon="🧾", layout="centered")
 
@@ -37,6 +37,7 @@ def compress_image(file, max_side: int = 1600, quality: int = 82) -> tuple[bytes
     คืน (bytes, new_width, new_height)
     """
     img = Image.open(file)
+    img = ImageOps.exif_transpose(img)  # หมุนรูปให้ตรงทิศทางจริงตาม EXIF ก่อน compress
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
     w, h = img.size
