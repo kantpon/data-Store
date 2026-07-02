@@ -164,11 +164,15 @@ st.markdown("#### 👤 ชื่อสาขาCJ")
 
 branch_list, zone_list = load_reference_lists()
 
+if "branch_key_v" not in st.session_state:
+    st.session_state.branch_key_v = 0
+branch_key = f"sender_name_{fv}_{st.session_state.branch_key_v}"
+
 sender_name = st.text_input(
     "ชื่อสาขาCJ",
     placeholder="เช่น สาขา สามแยกบางกอก (พิมพ์บางส่วนเพื่อค้นหา)",
     label_visibility="collapsed",
-    key=f"sender_name_{fv}",
+    key=branch_key,
 )
 
 # ── แสดงตัวเลือกที่ตรงกับคำที่พิมพ์ ให้กดเลือกได้เลย (พิมพ์เองก็ได้ถ้าไม่มีในลิสต์) ──
@@ -181,18 +185,23 @@ if branch_list and len(sender_name.strip()) >= 2 and sender_name not in branch_l
         for j, m in enumerate(matches):
             with sug_cols[j]:
                 if st.button(m, key=f"sug_branch_{fv}_{j}", use_container_width=True):
-                    st.session_state[f"sender_name_{fv}"] = m
+                    st.session_state.branch_key_v += 1
+                    st.session_state[f"sender_name_{fv}_{st.session_state.branch_key_v}"] = m
                     st.rerun()
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### Zone")
+
+if "zone_key_v" not in st.session_state:
+    st.session_state.zone_key_v = 0
+zone_key = f"zone_{fv}_{st.session_state.zone_key_v}"
 
 if zone_list:
     zone = st.text_input(
         "Zone",
         placeholder="เช่น BN BG (พิมพ์บางส่วนเพื่อค้นหา)",
         label_visibility="collapsed",
-        key=f"zone_{fv}",
+        key=zone_key,
     )
     if len(zone.strip()) >= 2 and zone not in zone_list:
         typed_z = zone.strip().lower()
@@ -203,10 +212,11 @@ if zone_list:
             for j, m in enumerate(matches_z):
                 with sug_cols_z[j]:
                     if st.button(m, key=f"sug_zone_{fv}_{j}", use_container_width=True):
-                        st.session_state[f"zone_{fv}"] = m
+                        st.session_state.zone_key_v += 1
+                        st.session_state[f"zone_{fv}_{st.session_state.zone_key_v}"] = m
                         st.rerun()
 else:
-    zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=f"zone_{fv}")
+    zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=zone_key)
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 🏪 สถานะร้าน")
@@ -265,6 +275,8 @@ if shop_closed:
                 )
                 st.session_state.form_version += 1
                 st.session_state.rotations = {}
+                st.session_state.branch_key_v = 0
+                st.session_state.zone_key_v = 0
                 st.rerun()
             else:
                 st.markdown(f'<div class="error-box">❌ บันทึกลง Google Sheet ไม่สำเร็จ: {err}</div>', unsafe_allow_html=True)
@@ -395,6 +407,8 @@ else:
                         st.session_state.flash = success_html + sheet_fail_html
                         st.session_state.form_version += 1
                         st.session_state.rotations = {}
+                        st.session_state.branch_key_v = 0
+                        st.session_state.zone_key_v = 0
                         st.rerun()
                     else:
                         st.markdown(success_html, unsafe_allow_html=True)
