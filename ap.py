@@ -54,7 +54,7 @@ def setup_gsheet():
     sheet = setup_gsheet_client()
     return sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "receipts"))
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_reference_lists():
     """
     ดึงรายชื่อสาขา/โซน จากแท็บอ้างอิง (default ชื่อ 'รายชื่อสาขา') ในไฟล์เดียวกัน
@@ -172,7 +172,7 @@ sender_name = st.text_input(
 )
 
 # ── แสดงตัวเลือกที่ตรงกับคำที่พิมพ์ ให้กดเลือกได้เลย (พิมพ์เองก็ได้ถ้าไม่มีในลิสต์) ──
-if branch_list and sender_name.strip() and sender_name not in branch_list:
+if branch_list and len(sender_name.strip()) >= 2 and sender_name not in branch_list:
     typed = sender_name.strip().lower()
     matches = [b for b in branch_list if typed in b.lower()][:5]
     if matches:
@@ -194,7 +194,7 @@ if zone_list:
         label_visibility="collapsed",
         key=f"zone_{fv}",
     )
-    if zone.strip() and zone not in zone_list:
+    if len(zone.strip()) >= 2 and zone not in zone_list:
         typed_z = zone.strip().lower()
         matches_z = [z for z in zone_list if typed_z in z.lower()][:5]
         if matches_z:
