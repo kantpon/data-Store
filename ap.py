@@ -119,9 +119,18 @@ def upload_to_cloudinary(image_bytes, filename):
 
 setup_cloudinary()
 
+if "form_version" not in st.session_state:
+    st.session_state.form_version = 0
+fv = st.session_state.form_version  # ใช้ต่อท้าย key ของแต่ละช่อง เพื่อรีเซ็ตฟอร์มได้หลังส่งสำเร็จ
+
 st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+if st.session_state.get("flash"):
+    st.markdown(st.session_state.flash, unsafe_allow_html=True)
+    del st.session_state["flash"]
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
 mode = st.radio("โหมด", [ "2 ใบเสร็จ"], label_visibility="collapsed")
@@ -129,11 +138,11 @@ num_receipts = int(mode[0])
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 👤 ชื่อสาขาCJ")
-sender_name = st.text_input("ชื่อสาขาCJ", placeholder="เช่น สาขา สามแยกบางกอก", label_visibility="collapsed")
+sender_name = st.text_input("ชื่อสาขาCJ", placeholder="เช่น สาขา สามแยกบางกอก", label_visibility="collapsed", key=f"sender_name_{fv}")
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### Zone")
-zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed")
+zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=f"zone_{fv}")
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 🏪 สถานะร้าน")
@@ -141,6 +150,7 @@ shop_status = st.radio(
     "สถานะร้าน",
     ["ร้านเปิด (ส่งรูปใบเสร็จ)", "ร้านปิด (ไม่มีรูป)"],
     label_visibility="collapsed",
+    key=f"shop_status_{fv}",
 )
 shop_closed = shop_status == "ร้านปิด (ไม่มีรูป)"
 
@@ -155,6 +165,7 @@ if shop_closed:
         "เหตุผลที่ร้านปิด",
         placeholder="เช่น ร้านปิดปรับปรุง, เครื่องเสีย, ไม่พบร้าน, อื่นๆ",
         label_visibility="collapsed",
+        key=f"closed_reason_{fv}",
     )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -179,16 +190,18 @@ if shop_closed:
             )
             ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             if ok:
-                st.markdown(
+                st.session_state.flash = (
                     f'<div class="success-box">'
                     f'<strong>✅ บันทึกข้อมูลสำเร็จ!</strong><br>'
                     f'🏪 สาขา: {sender_name.strip()}<br>'
                     f'📍 Zone: {zone.strip()}<br>'
                     f'📝 เหตุผล: {closed_reason.strip()}<br>'
                     f'🕒 เวลา: {ts}'
-                    f'</div>',
-                    unsafe_allow_html=True,
+                    f'</div>'
                 )
+                st.session_state.form_version += 1
+                st.session_state.rotations = {}
+                st.rerun()
             else:
                 st.markdown(f'<div class="error-box">❌ บันทึกลง Google Sheet ไม่สำเร็จ: {err}</div>', unsafe_allow_html=True)
 
@@ -199,12 +212,14 @@ else:
         "เก็บบิลครบไหม",
         ["-- กรุณาเลือก --", "ครบ", "ไม่ครบ"],
         label_visibility="collapsed",
+        key=f"completeness_{fv}",
     )
 
     if completeness == "ไม่ครบ":
         incomplete_reason = st.text_input(
             "เหตุผลที่เก็บไม่ครบ",
             placeholder="เช่น เครื่องเสีย, ร้านไม่เปิด, อื่นๆ",
+            key=f"incomplete_reason_{fv}",
         )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -216,6 +231,7 @@ else:
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         label_visibility="collapsed",
+        key=f"file_uploader_{fv}",
     )
 
     if uploaded_files:
@@ -301,13 +317,25 @@ else:
                     lines = [f"<strong>✅ อัพโหลดสำเร็จ {len(ok)} รูป!</strong>"]
                     for r in ok:
                         lines.append(f"📄 {r['filename']}.jpg &nbsp;·&nbsp; {r['dim']} px &nbsp;·&nbsp; {r['size_kb']} KB")
-                    st.markdown(f'<div class="success-box">{"<br>".join(lines)}</div>', unsafe_allow_html=True)
+                    success_html = f'<div class="success-box">{"<br>".join(lines)}</div>'
 
                     sheet_fail = [r for r in ok if not r.get("log_ok", True)]
+                    sheet_fail_html = ""
                     if sheet_fail:
                         lines2 = ["<strong>⚠️ อัพโหลดรูปสำเร็จ แต่บันทึกลง Google Sheet ไม่สำเร็จ:</strong>"]
                         lines2 += [f"• {r['filename']}: {r.get('log_err','')}" for r in sheet_fail]
-                        st.markdown(f'<div class="error-box">{"<br>".join(lines2)}</div>', unsafe_allow_html=True)
+                        sheet_fail_html = f'<div class="error-box">{"<br>".join(lines2)}</div>'
+
+                    if not fail:
+                        # ทุกรูปอัพโหลดสำเร็จหมด -> ล้างฟอร์มทั้งหมดให้พร้อมกรอกรอบใหม่
+                        st.session_state.flash = success_html + sheet_fail_html
+                        st.session_state.form_version += 1
+                        st.session_state.rotations = {}
+                        st.rerun()
+                    else:
+                        st.markdown(success_html, unsafe_allow_html=True)
+                        if sheet_fail_html:
+                            st.markdown(sheet_fail_html, unsafe_allow_html=True)
                 if fail:
                     lines = [f"<strong>❌ ไม่สำเร็จ {len(fail)} รูป</strong>"]
                     lines += [f"• {r['filename']}: {r.get('err','')}" for r in fail]
