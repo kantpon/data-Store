@@ -34,9 +34,9 @@ def setup_cloudinary():
     )
 
 @st.cache_resource
-def setup_gsheet():
+def setup_gsheet_client():
     """
-    เชื่อมต่อ Google Sheet ผ่าน Service Account
+    เชื่อมต่อไปยัง Google Spreadsheet (ทั้งไฟล์) ผ่าน Service Account
     ต้องมี st.secrets["gcp_service_account"] และ st.secrets["gsheet"]["sheet_url"]
     """
     scopes = [
@@ -47,9 +47,32 @@ def setup_gsheet():
         dict(st.secrets["gcp_service_account"]), scopes=scopes
     )
     client = gspread.authorize(creds)
-    sheet = client.open_by_url(st.secrets["gsheet"]["sheet_url"])
-    worksheet = sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "receipts"))
-    return worksheet
+    return client.open_by_url(st.secrets["gsheet"]["sheet_url"])
+
+def setup_gsheet():
+    """คืนแท็บสำหรับบันทึกข้อมูลใบเสร็จ (default ชื่อ 'receipts')"""
+    sheet = setup_gsheet_client()
+    return sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "receipts"))
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_reference_lists():
+    """
+    ดึงรายชื่อสาขา/โซน จากแท็บอ้างอิง (default ชื่อ 'รายชื่อสาขา') ในไฟล์เดียวกัน
+    คอลัมน์ A = สาขา, คอลัมน์ B = โซน (แถวแรกเป็นหัวตาราง)
+    ถ้าหาแท็บนี้ไม่เจอ หรือเชื่อมต่อไม่ได้ จะคืนลิสต์ว่างเงียบๆ (ไม่ error ให้ผู้ใช้เห็น)
+    """
+    try:
+        sheet = setup_gsheet_client()
+        ref_name = st.secrets["gsheet"].get("reference_worksheet_name", "รายชื่อสาขา")
+        ref_ws = sheet.worksheet(ref_name)
+        rows = ref_ws.get_all_values()
+        rows = rows[1:] if len(rows) > 1 else []  # ข้ามแถวหัวตาราง
+
+        branches = sorted({r[0].strip() for r in rows if len(r) > 0 and r[0].strip()})
+        zones = sorted({r[1].strip() for r in rows if len(r) > 1 and r[1].strip()})
+        return branches, zones
+    except Exception:
+        return [], []
 
 def log_to_sheet(branch, zone, status, reason="", filename="", url=""):
     """
@@ -138,11 +161,51 @@ num_receipts = int(mode[0])
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 👤 ชื่อสาขาCJ")
-sender_name = st.text_input("ชื่อสาขาCJ", placeholder="เช่น สาขา สามแยกบางกอก", label_visibility="collapsed", key=f"sender_name_{fv}")
+
+branch_list, zone_list = load_reference_lists()
+CUSTOM_OPTION = "✏️ พิมพ์ชื่อเอง (ไม่มีในลิสต์)"
+
+if branch_list:
+    branch_choice = st.selectbox(
+        "ชื่อสาขาCJ",
+        [CUSTOM_OPTION] + branch_list,
+        label_visibility="collapsed",
+        key=f"branch_select_{fv}",
+    )
+    if branch_choice == CUSTOM_OPTION:
+        sender_name = st.text_input(
+            "พิมพ์ชื่อสาขาเอง",
+            placeholder="เช่น สาขา สามแยกบางกอก",
+            label_visibility="collapsed",
+            key=f"sender_name_{fv}",
+        )
+    else:
+        sender_name = branch_choice
+else:
+    # ยังไม่มีลิสต์อ้างอิง (หรือดึงไม่สำเร็จ) -> ใช้ช่องพิมพ์ปกติเหมือนเดิม
+    sender_name = st.text_input("ชื่อสาขาCJ", placeholder="เช่น สาขา สามแยกบางกอก", label_visibility="collapsed", key=f"sender_name_{fv}")
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### Zone")
-zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=f"zone_{fv}")
+
+if zone_list:
+    zone_choice = st.selectbox(
+        "Zone",
+        [CUSTOM_OPTION] + zone_list,
+        label_visibility="collapsed",
+        key=f"zone_select_{fv}",
+    )
+    if zone_choice == CUSTOM_OPTION:
+        zone = st.text_input(
+            "พิมพ์ Zone เอง",
+            placeholder="เช่น BN BG",
+            label_visibility="collapsed",
+            key=f"zone_{fv}",
+        )
+    else:
+        zone = zone_choice
+else:
+    zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=f"zone_{fv}")
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 🏪 สถานะร้าน")
