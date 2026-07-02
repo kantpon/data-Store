@@ -163,47 +163,48 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 👤 ชื่อสาขาCJ")
 
 branch_list, zone_list = load_reference_lists()
-CUSTOM_OPTION = "✏️ พิมพ์ชื่อเอง (ไม่มีในลิสต์)"
 
-if branch_list:
-    branch_choice = st.selectbox(
-        "ชื่อสาขาCJ",
-        [CUSTOM_OPTION] + branch_list,
-        label_visibility="collapsed",
-        key=f"branch_select_{fv}",
-    )
-    if branch_choice == CUSTOM_OPTION:
-        sender_name = st.text_input(
-            "พิมพ์ชื่อสาขาเอง",
-            placeholder="เช่น สาขา สามแยกบางกอก",
-            label_visibility="collapsed",
-            key=f"sender_name_{fv}",
-        )
-    else:
-        sender_name = branch_choice
-else:
-    # ยังไม่มีลิสต์อ้างอิง (หรือดึงไม่สำเร็จ) -> ใช้ช่องพิมพ์ปกติเหมือนเดิม
-    sender_name = st.text_input("ชื่อสาขาCJ", placeholder="เช่น สาขา สามแยกบางกอก", label_visibility="collapsed", key=f"sender_name_{fv}")
+sender_name = st.text_input(
+    "ชื่อสาขาCJ",
+    placeholder="เช่น สาขา สามแยกบางกอก (พิมพ์บางส่วนเพื่อค้นหา)",
+    label_visibility="collapsed",
+    key=f"sender_name_{fv}",
+)
+
+# ── แสดงตัวเลือกที่ตรงกับคำที่พิมพ์ ให้กดเลือกได้เลย (พิมพ์เองก็ได้ถ้าไม่มีในลิสต์) ──
+if branch_list and sender_name.strip() and sender_name not in branch_list:
+    typed = sender_name.strip().lower()
+    matches = [b for b in branch_list if typed in b.lower()][:5]
+    if matches:
+        st.caption("👉 เลือกจากรายการ:")
+        sug_cols = st.columns(len(matches))
+        for j, m in enumerate(matches):
+            with sug_cols[j]:
+                if st.button(m, key=f"sug_branch_{fv}_{j}", use_container_width=True):
+                    st.session_state[f"sender_name_{fv}"] = m
+                    st.rerun()
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### Zone")
 
 if zone_list:
-    zone_choice = st.selectbox(
+    zone = st.text_input(
         "Zone",
-        [CUSTOM_OPTION] + zone_list,
+        placeholder="เช่น BN BG (พิมพ์บางส่วนเพื่อค้นหา)",
         label_visibility="collapsed",
-        key=f"zone_select_{fv}",
+        key=f"zone_{fv}",
     )
-    if zone_choice == CUSTOM_OPTION:
-        zone = st.text_input(
-            "พิมพ์ Zone เอง",
-            placeholder="เช่น BN BG",
-            label_visibility="collapsed",
-            key=f"zone_{fv}",
-        )
-    else:
-        zone = zone_choice
+    if zone.strip() and zone not in zone_list:
+        typed_z = zone.strip().lower()
+        matches_z = [z for z in zone_list if typed_z in z.lower()][:5]
+        if matches_z:
+            st.caption("👉 เลือกจากรายการ:")
+            sug_cols_z = st.columns(len(matches_z))
+            for j, m in enumerate(matches_z):
+                with sug_cols_z[j]:
+                    if st.button(m, key=f"sug_zone_{fv}_{j}", use_container_width=True):
+                        st.session_state[f"zone_{fv}"] = m
+                        st.rerun()
 else:
     zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=f"zone_{fv}")
 
