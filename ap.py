@@ -54,15 +54,27 @@ def setup_gsheet():
 def log_to_sheet(branch, zone, status, reason="", filename="", url=""):
     """
     บันทึกแถวข้อมูลลง Google Sheet
-    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
+    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message ที่ระบุสาเหตุชัดเจน)
     """
     try:
         worksheet = setup_gsheet()
         ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         worksheet.append_row([ts, branch, zone, status, reason, filename, url])
         return True, ""
+    except gspread.exceptions.WorksheetNotFound:
+        wanted = st.secrets.get("gsheet", {}).get("worksheet_name", "receipts")
+        return False, f"[WorksheetNotFound] ไม่พบแท็บชื่อ '{wanted}' ในชีต — ไปเช็คชื่อแท็บด้านล่างของ Google Sheet ให้ตรงกับ worksheet_name ใน secrets"
+    except gspread.exceptions.SpreadsheetNotFound:
+        return False, "[SpreadsheetNotFound] ไม่พบ Google Sheet ตาม sheet_url ที่ตั้งไว้ — เช็คว่าลิงก์ถูกต้องและยังมีอยู่จริง"
+    except gspread.exceptions.APIError as e:
+        msg = str(e)
+        if "PERMISSION_DENIED" in msg or "403" in msg:
+            return False, f"[PermissionDenied] Service Account ยังไม่มีสิทธิ์เข้าถึงชีตนี้ — ไปที่ Google Sheet กด Share แล้วใส่อีเมลจาก client_email ให้เป็น Editor. รายละเอียด: {msg}"
+        return False, f"[Google API Error] {msg}"
+    except KeyError as e:
+        return False, f"[KeyError] ยังไม่มีค่าที่ต้องใช้ใน secrets.toml: {e} — เช็คว่ามีกลุ่ม [gcp_service_account] และ [gsheet] ครบไหม"
     except Exception as e:
-        return False, str(e)
+        return False, f"[{type(e).__name__}] {str(e)}"
 
 def fix_orientation(file, thumb_side: int = 500, extra_rotation: int = 0):
     """เปิดรูป หมุนตาม EXIF ให้ถูกทาง + หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
