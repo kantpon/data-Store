@@ -21,6 +21,7 @@ st.markdown("""
     .success-box { background: #f0fdf4; border: 2px solid #86efac; border-radius: 14px; padding: 1.2rem 1.5rem; color: #166534; margin-top: 1rem; }
     .error-box { background: #fef2f2; border: 2px solid #fca5a5; border-radius: 14px; padding: 1.2rem 1.5rem; color: #991b1b; margin-top: 1rem; }
     .branch-box { background: #eef2ff; border: 2px solid #c7d2fe; border-radius: 14px; padding: 1rem 1.2rem; color: #3730a3; margin-top: 0.6rem; }
+    .guide-box { background: #fffbeb; border: 2px solid #fcd34d; border-radius: 14px; padding: 1.2rem 1.4rem; color: #92400e; margin: 1rem 0; line-height: 1.7; }
     .divider { border: none; border-top: 1.5px solid #f3f4f6; margin: 1.5rem 0; }
 </style>
 """, unsafe_allow_html=True)
@@ -268,21 +269,44 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
-    st.markdown(f"#### 🔍 รูปที่เลือก ({len(uploaded_files)} รูป)")
+    st.markdown(f"#### 🔍 ตรวจสอบรูปก่อนส่ง ({len(uploaded_files)} รูป)")
+
+    st.markdown(
+        '<div class="guide-box">'
+        '📸 <strong>โปรดถ่ายบิลให้ถูกต้อง</strong><br>'
+        '(ในขั้นตอนนี้ยังไม่ส่งบิล โปรดตรวจสอบและกดส่งอีกครั้ง)<br><br>'
+        '1. ภาพชัดให้อ่านค่าได้<br>'
+        '2. มีระยะห่างจากกันระหว่างบิล<br>'
+        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br><br>'
+        'ก่อนจะกดส่งย้ำอีกที'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     if "rotations" not in st.session_state:
         st.session_state.rotations = {}
 
-    cols = st.columns(3)
     for i, f in enumerate(uploaded_files):
         rot_key = f"{f.name}_{f.size}_{i}"
-        with cols[i % 3]:
-            current_rot = st.session_state.rotations.get(rot_key, 0)
-            preview_img = fix_orientation(f, extra_rotation=current_rot)
-            st.image(preview_img, caption=f.name, use_container_width=True)
-            if st.button("🔄 หมุน 90°", key=f"rotate_{rot_key}"):
+        current_rot = st.session_state.rotations.get(rot_key, 0)
+        preview_img = fix_orientation(f, thumb_side=1000, extra_rotation=current_rot)
+        st.image(preview_img, caption=f.name, use_container_width=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("↺ หมุนซ้าย", key=f"rotate_left_{rot_key}", use_container_width=True):
+                st.session_state.rotations[rot_key] = (current_rot - 90) % 360
+                st.rerun()
+        with c2:
+            if st.button("↻ หมุนขวา", key=f"rotate_right_{rot_key}", use_container_width=True):
                 st.session_state.rotations[rot_key] = (current_rot + 90) % 360
                 st.rerun()
+        with c3:
+            if st.button("🔃 กลับหัว", key=f"rotate_flip_{rot_key}", use_container_width=True):
+                st.session_state.rotations[rot_key] = (current_rot + 180) % 360
+                st.rerun()
+
+        st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
     st.info(f"จะบันทึกในโฟลเดอร์ branch ทั้ง {len(uploaded_files)} รูป")
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
