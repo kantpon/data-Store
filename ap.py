@@ -83,15 +83,16 @@ def load_branch_list():
     except Exception as e:
         return [], str(e)
 
-def log_to_sheet(branch, zone, status, reason="", filename="", url=""):
+def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url=""):
     """
     บันทึกแถวข้อมูลลง Google Sheet
+    ลำดับคอลัมน์: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
     คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
     """
     try:
         worksheet = setup_gsheet()
         ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        worksheet.append_row([ts, branch, zone, status, reason, filename, url])
+        worksheet.append_row([ts, reporter, branch, zone, status, reason, filename, url])
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -146,6 +147,15 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
 mode = st.radio("โหมด", [ "2 ใบเสร็จ"], label_visibility="collapsed")
 num_receipts = int(mode[0])
+
+# ── ชื่อผู้กรอก (พิมพ์เอง) ──
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 🙋 ชื่อผู้กรอก")
+reporter_name = st.text_input(
+    "ชื่อผู้กรอก",
+    placeholder="พิมพ์ชื่อผู้กรอกข้อมูล",
+    label_visibility="collapsed",
+)
 
 # ── เลือกสาขา (พิมพ์ค้นหาชื่อได้) แทนการพิมพ์เอง ──
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -236,6 +246,8 @@ if shop_closed:
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
     missing = []
+    if not reporter_name.strip():
+        missing.append("ชื่อผู้กรอก")
     if not sender_name.strip():
         missing.append("สาขา (กรุณาเลือกจากรายการ)")
     if not closed_reason.strip():
@@ -247,6 +259,7 @@ if shop_closed:
             st.markdown(f'<div class="error-box">⚠️ กรุณากรอกข้อมูลให้ครบก่อนส่ง:{items}</div>', unsafe_allow_html=True)
         else:
             ok, err = log_to_sheet(
+                reporter=reporter_name.strip(),
                 branch=sender_name.strip(),
                 zone=zone.strip(),
                 status="ร้านปิด",
@@ -257,6 +270,7 @@ if shop_closed:
                 st.markdown(
                     f'<div class="success-box">'
                     f'<strong>✅ บันทึกข้อมูลสำเร็จ!</strong><br>'
+                    f'🙋 ผู้กรอก: {reporter_name.strip()}<br>'
                     f'🏪 สาขา: {sender_name.strip()}<br>'
                     f'📍 Zone: {zone.strip()}<br>'
                     f'📝 เหตุผล: {closed_reason.strip()}<br>'
@@ -316,6 +330,8 @@ else:
 
         if st.button(f"☁️ อัพโหลดทั้งหมด ({len(uploaded_files)} รูป)"):
             missing = []
+            if not reporter_name.strip():
+                missing.append("ชื่อผู้กรอก")
             if not sender_name.strip():
                 missing.append("สาขา (กรุณาเลือกจากรายการ)")
             if completeness == "-- กรุณาเลือก --":
@@ -345,6 +361,7 @@ else:
 
                         status_label = "ครบ" if completeness == "ครบ" else "ไม่ครบ"
                         log_ok, log_err = log_to_sheet(
+                            reporter=reporter_name.strip(),
                             branch=sender_name.strip(),
                             zone=zone.strip(),
                             status=status_label,
