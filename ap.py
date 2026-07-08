@@ -20,7 +20,6 @@ st.markdown("""
     .stButton > button { background: linear-gradient(135deg, #667eea, #764ba2) !important; color: white !important; border: none !important; border-radius: 12px !important; padding: 0.75rem 2rem !important; font-size: 1.1rem !important; font-weight: 600 !important; width: 100%; }
     .success-box { background: #f0fdf4; border: 2px solid #86efac; border-radius: 14px; padding: 1.2rem 1.5rem; color: #166534; margin-top: 1rem; }
     .error-box { background: #fef2f2; border: 2px solid #fca5a5; border-radius: 14px; padding: 1.2rem 1.5rem; color: #991b1b; margin-top: 1rem; }
-    .branch-box { background: #eef2ff; border: 2px solid #c7d2fe; border-radius: 14px; padding: 1rem 1.2rem; color: #3730a3; margin-top: 0.6rem; }
     .divider { border: none; border-top: 1.5px solid #f3f4f6; margin: 1.5rem 0; }
 </style>
 """, unsafe_allow_html=True)
@@ -35,7 +34,11 @@ def setup_cloudinary():
     )
 
 @st.cache_resource
-def get_gsheet_client():
+def setup_gsheet_client():
+    """
+    เชื่อมต่อไปยัง Google Spreadsheet (ทั้งไฟล์) ผ่าน Service Account
+    ต้องมี st.secrets["gcp_service_account"] และ st.secrets["gsheet"]["sheet_url"]
+    """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -43,58 +46,58 @@ def get_gsheet_client():
     creds = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]), scopes=scopes
     )
-    return gspread.authorize(creds)
+    client = gspread.authorize(creds)
+    return client.open_by_url(st.secrets["gsheet"]["sheet_url"])
 
 def setup_gsheet():
-    """
-    เชื่อมต่อ Google Sheet (ชีทบันทึกผลลัพธ์) ผ่าน Service Account
-    ต้องมี st.secrets["gcp_service_account"] และ st.secrets["gsheet"]["sheet_url"]
-    """
-    client = get_gsheet_client()
-    sheet = client.open_by_url(st.secrets["gsheet"]["sheet_url"])
-    worksheet = sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "receipts"))
-    return worksheet
+    """คืนแท็บสำหรับบันทึกข้อมูลใบเสร็จ (default ชื่อ 'receipts')"""
+    sheet = setup_gsheet_client()
+    return sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "receipts"))
 
-@st.cache_data(ttl=300)
-def load_branch_list():
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_reference_lists():
     """
-    โหลดรายชื่อสาขาจากชีท "รายชื่อสาขา"
-    คอลัมน์ในชีท: A=รายชื่อสาขา, B=zone, C=สถานะ (ไม่มีคอลัมน์รหัสสาขา)
-    ตั้งชื่อ worksheet ผ่าน st.secrets["gsheet"]["branch_worksheet_name"] (ค่าเริ่มต้น "รายชื่อสาขา")
-    ตั้ง URL ชีทแยกได้ผ่าน st.secrets["gsheet"]["branch_sheet_url"] (ถ้าไม่ตั้ง จะใช้ sheet_url เดิม)
-    คืนค่า list ของ dict: [{"name":..., "zone":..., "status":...}, ...]
+    ดึงรายชื่อสาขา/โซน จากแท็บอ้างอิง (default ชื่อ 'รายชื่อสาขา') ในไฟล์เดียวกัน
+    คอลัมน์ A = สาขา, คอลัมน์ B = โซน (แถวแรกเป็นหัวตาราง)
+    ถ้าหาแท็บนี้ไม่เจอ หรือเชื่อมต่อไม่ได้ จะคืนลิสต์ว่างเงียบๆ (ไม่ error ให้ผู้ใช้เห็น)
     """
     try:
-        client = get_gsheet_client()
-        sheet_url = st.secrets["gsheet"].get("branch_sheet_url", st.secrets["gsheet"]["sheet_url"])
-        sheet = client.open_by_url(sheet_url)
-        ws_name = st.secrets["gsheet"].get("branch_worksheet_name", "รายชื่อสาขา")
-        worksheet = sheet.worksheet(ws_name)
-        records = worksheet.get_all_records()  # ใช้แถวแรกเป็น header อัตโนมัติ
+        sheet = setup_gsheet_client()
+        ref_name = st.secrets["gsheet"].get("reference_worksheet_name", "รายชื่อสาขา")
+        ref_ws = sheet.worksheet(ref_name)
+        rows = ref_ws.get_all_values()
+        rows = rows[1:] if len(rows) > 1 else []  # ข้ามแถวหัวตาราง
 
-        branches = []
-        for r in records:
-            name = str(r.get("รายชื่อสาขา", "")).strip()
-            zone = str(r.get("zone", "")).strip()
-            status = str(r.get("สถานะ", "")).strip()
-            if name:
-                branches.append({"name": name, "zone": zone, "status": status})
-        return branches, ""
-    except Exception as e:
-        return [], str(e)
+        branches = sorted({r[0].strip() for r in rows if len(r) > 0 and r[0].strip()})
+        zones = sorted({r[1].strip() for r in rows if len(r) > 1 and r[1].strip()})
+        return branches, zones
+    except Exception:
+        return [], []
 
 def log_to_sheet(branch, zone, status, reason="", filename="", url=""):
     """
     บันทึกแถวข้อมูลลง Google Sheet
-    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
+    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message ที่ระบุสาเหตุชัดเจน)
     """
     try:
         worksheet = setup_gsheet()
         ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         worksheet.append_row([ts, branch, zone, status, reason, filename, url])
         return True, ""
+    except gspread.exceptions.WorksheetNotFound:
+        wanted = st.secrets.get("gsheet", {}).get("worksheet_name", "receipts")
+        return False, f"[WorksheetNotFound] ไม่พบแท็บชื่อ '{wanted}' ในชีต — ไปเช็คชื่อแท็บด้านล่างของ Google Sheet ให้ตรงกับ worksheet_name ใน secrets"
+    except gspread.exceptions.SpreadsheetNotFound:
+        return False, "[SpreadsheetNotFound] ไม่พบ Google Sheet ตาม sheet_url ที่ตั้งไว้ — เช็คว่าลิงก์ถูกต้องและยังมีอยู่จริง"
+    except gspread.exceptions.APIError as e:
+        msg = str(e)
+        if "PERMISSION_DENIED" in msg or "403" in msg:
+            return False, f"[PermissionDenied] Service Account ยังไม่มีสิทธิ์เข้าถึงชีตนี้ — ไปที่ Google Sheet กด Share แล้วใส่อีเมลจาก client_email ให้เป็น Editor. รายละเอียด: {msg}"
+        return False, f"[Google API Error] {msg}"
+    except KeyError as e:
+        return False, f"[KeyError] ยังไม่มีค่าที่ต้องใช้ใน secrets.toml: {e} — เช็คว่ามีกลุ่ม [gcp_service_account] และ [gsheet] ครบไหม"
     except Exception as e:
-        return False, str(e)
+        return False, f"[{type(e).__name__}] {str(e)}"
 
 def fix_orientation(file, thumb_side: int = 500, extra_rotation: int = 0):
     """เปิดรูป หมุนตาม EXIF ให้ถูกทาง + หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
@@ -139,65 +142,81 @@ def upload_to_cloudinary(image_bytes, filename):
 
 setup_cloudinary()
 
+if "form_version" not in st.session_state:
+    st.session_state.form_version = 0
+fv = st.session_state.form_version  # ใช้ต่อท้าย key ของแต่ละช่อง เพื่อรีเซ็ตฟอร์มได้หลังส่งสำเร็จ
+
 st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+if st.session_state.get("flash"):
+    st.markdown(st.session_state.flash, unsafe_allow_html=True)
+    del st.session_state["flash"]
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
 mode = st.radio("โหมด", [ "2 ใบเสร็จ"], label_visibility="collapsed")
 num_receipts = int(mode[0])
 
-# ── เลือกสาขา (พิมพ์ค้นหาชื่อได้) แทนการพิมพ์เอง ──
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown("#### 🏢 เลือกสาขา (พิมพ์เพื่อค้นหาชื่อสาขา)")
+st.markdown("#### 👤 ชื่อสาขาCJ")
 
-branches, branch_err = load_branch_list()
+branch_list, zone_list = load_reference_lists()
 
-if branch_err:
-    st.markdown(
-        f'<div class="error-box">❌ โหลดรายชื่อสาขาไม่สำเร็จ: {branch_err}<br>'
-        f'ตรวจสอบว่ามี worksheet ชื่อ "รายชื่อสาขา" (หรือชื่อที่ตั้งใน secrets) '
-        f'และมีคอลัมน์หัวตาราง รายชื่อสาขา, zone, สถานะ</div>',
-        unsafe_allow_html=True,
-    )
-    sender_name, zone = "", ""
-elif not branches:
-    st.markdown('<div class="error-box">⚠️ ยังไม่มีรายชื่อสาขาในชีท กรุณาเพิ่มข้อมูลก่อนใช้งาน</div>', unsafe_allow_html=True)
-    sender_name, zone = "", ""
-else:
-    # ถ้ามีชื่อสาขาซ้ำกันในชีท ให้เติม zone ต่อท้ายเพื่อแยกให้ชัดเจนตอนเลือก
-    names_seen = {}
-    for b in branches:
-        names_seen[b["name"]] = names_seen.get(b["name"], 0) + 1
+if "branch_key_v" not in st.session_state:
+    st.session_state.branch_key_v = 0
+branch_key = f"sender_name_{fv}_{st.session_state.branch_key_v}"
 
-    def display_label(b):
-        if names_seen[b["name"]] > 1:
-            return f'{b["name"]} ({b["zone"]})'
-        return b["name"]
+sender_name = st.text_input(
+    "ชื่อสาขาCJ",
+    placeholder="เช่น สาขา สามแยกบางกอก (พิมพ์บางส่วนเพื่อค้นหา)",
+    label_visibility="collapsed",
+    key=branch_key,
+)
 
-    branch_options = ["-- กรุณาเลือกสาขา --"] + [display_label(b) for b in branches]
-    picked = st.selectbox(
-        "เลือกสาขา",
-        branch_options,
+# ── แสดงตัวเลือกที่ตรงกับคำที่พิมพ์ ให้กดเลือกได้เลย (พิมพ์เองก็ได้ถ้าไม่มีในลิสต์) ──
+if branch_list and len(sender_name.strip()) >= 2 and sender_name not in branch_list:
+    typed = sender_name.strip().lower()
+    matches = [b for b in branch_list if typed in b.lower()][:5]
+    if matches:
+        st.caption("👉 เลือกจากรายการ:")
+        sug_cols = st.columns(len(matches))
+        for j, m in enumerate(matches):
+            with sug_cols[j]:
+                if st.button(m, key=f"sug_branch_{fv}_{j}", use_container_width=True):
+                    st.session_state.branch_key_v += 1
+                    st.session_state[f"sender_name_{fv}_{st.session_state.branch_key_v}"] = m
+                    st.rerun()
+
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### Zone")
+
+if "zone_key_v" not in st.session_state:
+    st.session_state.zone_key_v = 0
+zone_key = f"zone_{fv}_{st.session_state.zone_key_v}"
+
+if zone_list:
+    zone = st.text_input(
+        "Zone",
+        placeholder="เช่น BN BG (พิมพ์บางส่วนเพื่อค้นหา)",
         label_visibility="collapsed",
+        key=zone_key,
     )
-
-    if picked != "-- กรุณาเลือกสาขา --":
-        matched = next((b for b in branches if display_label(b) == picked), None)
-    else:
-        matched = None
-
-    if matched:
-        sender_name = matched["name"]
-        zone = matched["zone"]
-        status_note = f' &nbsp;·&nbsp; สถานะ: {matched["status"]}' if matched["status"] else ""
-        st.markdown(
-            f'<div class="branch-box">🏪 <strong>{matched["name"]}</strong> '
-            f'&nbsp;·&nbsp; Zone {matched["zone"] or "-"}{status_note}</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        sender_name, zone = "", ""
+    if len(zone.strip()) >= 2 and zone not in zone_list:
+        typed_z = zone.strip().lower()
+        matches_z = [z for z in zone_list if typed_z in z.lower()][:5]
+        if matches_z:
+            st.caption("👉 เลือกจากรายการ:")
+            sug_cols_z = st.columns(len(matches_z))
+            for j, m in enumerate(matches_z):
+                with sug_cols_z[j]:
+                    if st.button(m, key=f"sug_zone_{fv}_{j}", use_container_width=True):
+                        st.session_state.zone_key_v += 1
+                        st.session_state[f"zone_{fv}_{st.session_state.zone_key_v}"] = m
+                        st.rerun()
+else:
+    zone = st.text_input("Zone", placeholder="เช่น BN BG", label_visibility="collapsed", key=zone_key)
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 🏪 สถานะร้าน")
@@ -205,6 +224,7 @@ shop_status = st.radio(
     "สถานะร้าน",
     ["ร้านเปิด (ส่งรูปใบเสร็จ)", "ร้านปิด (ไม่มีรูป)"],
     label_visibility="collapsed",
+    key=f"shop_status_{fv}",
 )
 shop_closed = shop_status == "ร้านปิด (ไม่มีรูป)"
 
@@ -219,12 +239,15 @@ if shop_closed:
         "เหตุผลที่ร้านปิด",
         placeholder="เช่น ร้านปิดปรับปรุง, เครื่องเสีย, ไม่พบร้าน, อื่นๆ",
         label_visibility="collapsed",
+        key=f"closed_reason_{fv}",
     )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
     missing = []
     if not sender_name.strip():
-        missing.append("สาขา (กรุณาเลือกจากรายการ)")
+        missing.append("ชื่อสาขาCJ")
+    if not zone.strip():
+        missing.append("Zone")
     if not closed_reason.strip():
         missing.append("เหตุผลที่ร้านปิด")
 
@@ -241,16 +264,20 @@ if shop_closed:
             )
             ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             if ok:
-                st.markdown(
+                st.session_state.flash = (
                     f'<div class="success-box">'
                     f'<strong>✅ บันทึกข้อมูลสำเร็จ!</strong><br>'
                     f'🏪 สาขา: {sender_name.strip()}<br>'
                     f'📍 Zone: {zone.strip()}<br>'
                     f'📝 เหตุผล: {closed_reason.strip()}<br>'
                     f'🕒 เวลา: {ts}'
-                    f'</div>',
-                    unsafe_allow_html=True,
+                    f'</div>'
                 )
+                st.session_state.form_version += 1
+                st.session_state.rotations = {}
+                st.session_state.branch_key_v = 0
+                st.session_state.zone_key_v = 0
+                st.rerun()
             else:
                 st.markdown(f'<div class="error-box">❌ บันทึกลง Google Sheet ไม่สำเร็จ: {err}</div>', unsafe_allow_html=True)
 
@@ -261,12 +288,14 @@ else:
         "เก็บบิลครบไหม",
         ["-- กรุณาเลือก --", "ครบ", "ไม่ครบ"],
         label_visibility="collapsed",
+        key=f"completeness_{fv}",
     )
 
     if completeness == "ไม่ครบ":
         incomplete_reason = st.text_input(
             "เหตุผลที่เก็บไม่ครบ",
             placeholder="เช่น เครื่องเสีย, ร้านไม่เปิด, อื่นๆ",
+            key=f"incomplete_reason_{fv}",
         )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -278,6 +307,7 @@ else:
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
         label_visibility="collapsed",
+        key=f"file_uploader_{fv}",
     )
 
     if uploaded_files:
@@ -304,7 +334,9 @@ else:
         if st.button(f"☁️ อัพโหลดทั้งหมด ({len(uploaded_files)} รูป)"):
             missing = []
             if not sender_name.strip():
-                missing.append("สาขา (กรุณาเลือกจากรายการ)")
+                missing.append("ชื่อสาขาCJ")
+            if not zone.strip():
+                missing.append("Zone")
             if completeness == "-- กรุณาเลือก --":
                 missing.append("เก็บบิลครบไหม")
             if completeness == "ไม่ครบ" and not incomplete_reason.strip():
@@ -361,13 +393,27 @@ else:
                     lines = [f"<strong>✅ อัพโหลดสำเร็จ {len(ok)} รูป!</strong>"]
                     for r in ok:
                         lines.append(f"📄 {r['filename']}.jpg &nbsp;·&nbsp; {r['dim']} px &nbsp;·&nbsp; {r['size_kb']} KB")
-                    st.markdown(f'<div class="success-box">{"<br>".join(lines)}</div>', unsafe_allow_html=True)
+                    success_html = f'<div class="success-box">{"<br>".join(lines)}</div>'
 
                     sheet_fail = [r for r in ok if not r.get("log_ok", True)]
+                    sheet_fail_html = ""
                     if sheet_fail:
                         lines2 = ["<strong>⚠️ อัพโหลดรูปสำเร็จ แต่บันทึกลง Google Sheet ไม่สำเร็จ:</strong>"]
                         lines2 += [f"• {r['filename']}: {r.get('log_err','')}" for r in sheet_fail]
-                        st.markdown(f'<div class="error-box">{"<br>".join(lines2)}</div>', unsafe_allow_html=True)
+                        sheet_fail_html = f'<div class="error-box">{"<br>".join(lines2)}</div>'
+
+                    if not fail:
+                        # ทุกรูปอัพโหลดสำเร็จหมด -> ล้างฟอร์มทั้งหมดให้พร้อมกรอกรอบใหม่
+                        st.session_state.flash = success_html + sheet_fail_html
+                        st.session_state.form_version += 1
+                        st.session_state.rotations = {}
+                        st.session_state.branch_key_v = 0
+                        st.session_state.zone_key_v = 0
+                        st.rerun()
+                    else:
+                        st.markdown(success_html, unsafe_allow_html=True)
+                        if sheet_fail_html:
+                            st.markdown(sheet_fail_html, unsafe_allow_html=True)
                 if fail:
                     lines = [f"<strong>❌ ไม่สำเร็จ {len(fail)} รูป</strong>"]
                     lines += [f"• {r['filename']}: {r.get('err','')}" for r in fail]
