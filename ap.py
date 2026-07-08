@@ -223,24 +223,37 @@ else:
         sender_name, zone = "", ""
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown("#### 🏪 สถานะร้าน")
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 📦 เก็บบิลครบไหม")
-completeness = st.selectbox(
+st.caption("เลือก \"ครบ\" หรือเลือกเครื่องที่ขาดได้หลายเครื่อง (เลือก \"ครบ\" แล้วจะเลือกเครื่องอื่นไม่ได้)")
+
+def _enforce_completeness_exclusive():
+    prev = st.session_state.get("_prev_completeness_sel", [])
+    cur = st.session_state.completeness_sel
+    added = [x for x in cur if x not in prev]
+    if added:
+        new_item = added[0]
+        if new_item == "ครบ":
+            st.session_state.completeness_sel = ["ครบ"]
+        elif "ครบ" in cur:
+            st.session_state.completeness_sel = [x for x in cur if x != "ครบ"]
+    st.session_state["_prev_completeness_sel"] = st.session_state.completeness_sel
+
+completeness_sel = st.multiselect(
     "เก็บบิลครบไหม",
-    ["-- กรุณาเลือก --", "ครบ", "ไม่ครบ"],
+    ["ครบ", "เครื่อง 1", "เครื่อง 2", "เครื่อง 3", "เครื่อง 4"],
     label_visibility="collapsed",
+    key="completeness_sel",
+    on_change=_enforce_completeness_exclusive,
 )
 
-incomplete_reason = ""
-if completeness == "ไม่ครบ":
-    st.caption("เลือกเครื่องที่ขาด (เลือกได้หลายเครื่อง)")
-    missing_machines = st.multiselect(
-        "เครื่องที่ขาด",
-        ["เครื่อง 1", "เครื่อง 2", "เครื่อง 3", "เครื่อง 4"],
-        label_visibility="collapsed",
-    )
-    incomplete_reason = ", ".join(missing_machines)
+if "ครบ" in completeness_sel:
+    completeness = "ครบ"
+elif completeness_sel:
+    completeness = "ไม่ครบ"
+else:
+    completeness = "-- กรุณาเลือก --"
+
+incomplete_reason = ", ".join([x for x in completeness_sel if x != "ครบ"])
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown("#### 📷 เลือกรูปภาพ (เลือกได้หลายรูปพร้อมกัน)")
