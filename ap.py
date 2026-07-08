@@ -223,7 +223,7 @@ else:
         sender_name, zone = "", ""
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown("#### 📦 เก็บบิลครบไหม")
+st.markdown("#### 📦 เครื่องที่ขาด")
 st.caption("เลือก \"ครบ\" หรือเลือกเครื่องที่ขาดได้หลายเครื่อง (เลือก \"ครบ\" แล้วจะเลือกเครื่องอื่นไม่ได้)")
 
 def _enforce_completeness_exclusive():
@@ -239,8 +239,8 @@ def _enforce_completeness_exclusive():
     st.session_state["_prev_completeness_sel"] = st.session_state.completeness_sel
 
 completeness_sel = st.multiselect(
-    "เก็บบิลครบไหม",
-    ["ครบ", "เครื่อง 1", "เครื่อง 2", "เครื่อง 3", "เครื่อง 4"],
+    "เครื่องที่ขาด",
+    ["ครบ", "ขาดเครื่องที่ 1", "ขาดเครื่องที่ 2", "ขาดเครื่องที่ 3", "ขาดเครื่องที่ 4"],
     label_visibility="collapsed",
     key="completeness_sel",
     on_change=_enforce_completeness_exclusive,
@@ -294,7 +294,7 @@ if uploaded_files:
         if not sender_name.strip():
             missing.append("สาขา (กรุณาเลือกจากรายการ)")
         if completeness == "-- กรุณาเลือก --":
-            missing.append("เก็บบิลครบไหม")
+            missing.append("เครื่องที่ขาด")
         if completeness == "ไม่ครบ" and not incomplete_reason.strip():
             missing.append("เครื่องที่ขาด (เลือกอย่างน้อย 1 เครื่อง)")
 
