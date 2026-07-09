@@ -141,6 +141,19 @@ def upload_to_cloudinary(image_bytes, filename):
 
 setup_cloudinary()
 
+if "show_sent_dialog" not in st.session_state:
+    st.session_state.show_sent_dialog = False
+if "sent_count" not in st.session_state:
+    st.session_state.sent_count = 0
+
+@st.dialog("✅ ส่งข้อมูลสำเร็จ")
+def show_success_dialog():
+    st.markdown("### คุณส่งแล้ว")
+    st.write(f"อัพโหลดใบเสร็จ {st.session_state.sent_count} รูป และบันทึกข้อมูลเรียบร้อยแล้ว")
+    if st.button("ตกลง", use_container_width=True):
+        st.session_state.show_sent_dialog = False
+        st.rerun()
+
 st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -278,7 +291,7 @@ if uploaded_files:
         '1. ภาพชัดให้อ่านค่าได้<br>'
         '2. มีระยะห่างจากกันระหว่างบิล<br>'
         '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br><br>'
-        
+
         '</div>',
         unsafe_allow_html=True,
     )
@@ -381,10 +394,17 @@ if uploaded_files:
                     lines2 = ["<strong>⚠️ อัพโหลดรูปสำเร็จ แต่บันทึกลง Google Sheet ไม่สำเร็จ:</strong>"]
                     lines2 += [f"• {r['filename']}: {r.get('log_err','')}" for r in sheet_fail]
                     st.markdown(f'<div class="error-box">{"<br>".join(lines2)}</div>', unsafe_allow_html=True)
+                else:
+                    st.session_state.show_sent_dialog = True
+                    st.session_state.sent_count = len(ok)
+                    st.rerun()
             if fail:
                 lines = [f"<strong>❌ ไม่สำเร็จ {len(fail)} รูป</strong>"]
                 lines += [f"• {r['filename']}: {r.get('err','')}" for r in fail]
                 st.markdown(f'<div class="error-box">{"<br>".join(lines)}</div>', unsafe_allow_html=True)
+
+if st.session_state.show_sent_dialog:
+    show_success_dialog()
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<p style="text-align:center;color:#d1d5db;font-size:0.8rem;">รูปทั้งหมดจะถูกส่งเข้าบัญชี Cloudinary ของเจ้าของระบบเท่านั้น</p>', unsafe_allow_html=True)
