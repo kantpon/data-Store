@@ -242,7 +242,7 @@ def load_branch_list():
 
 
 # =========================================================
-# GOOGLE SHEET LOG
+# WRITE GOOGLE SHEET
 # =========================================================
 
 def log_to_sheet(
@@ -285,7 +285,7 @@ def log_to_sheet(
 
 
 # =========================================================
-# RETRY GOOGLE SHEET
+# WRITE GOOGLE SHEET WITH RETRY
 # =========================================================
 
 def log_to_sheet_with_retry(
@@ -303,29 +303,23 @@ def log_to_sheet_with_retry(
 
     for attempt in range(1, max_retries + 1):
 
-        try:
+        success, error = log_to_sheet(
+            reporter=reporter,
+            branch=branch,
+            zone=zone,
+            status=status,
+            reason=reason,
+            filename=filename,
+            url=url
+        )
 
-            success, error = log_to_sheet(
-                reporter=reporter,
-                branch=branch,
-                zone=zone,
-                status=status,
-                reason=reason,
-                filename=filename,
-                url=url
-            )
+        if success:
 
-            if success:
+            return True, "", attempt
 
-                return True, "", attempt
+        last_error = error
 
-            last_error = error
-
-        except Exception as e:
-
-            last_error = str(e)
-
-        # ถ้ายังไม่ใช่รอบสุดท้าย
+        # ถ้ายังมีรอบเหลือ
         if attempt < max_retries:
 
             time.sleep(2 * attempt)
@@ -339,8 +333,8 @@ def log_to_sheet_with_retry(
 
 def fix_orientation(
     file,
-    thumb_side: int = 500,
-    extra_rotation: int = 0
+    thumb_side=500,
+    extra_rotation=0
 ):
 
     img = Image.open(file)
@@ -368,9 +362,9 @@ def fix_orientation(
 
 def compress_image(
     file,
-    max_side: int = 1280,
-    quality: int = 78,
-    extra_rotation: int = 0
+    max_side=1280,
+    quality=78,
+    extra_rotation=0
 ):
 
     img = Image.open(file)
@@ -455,11 +449,9 @@ def upload_to_cloudinary(
 
 setup_cloudinary()
 
-
 if "show_sent_dialog" not in st.session_state:
 
     st.session_state.show_sent_dialog = False
-
 
 if "sent_count" not in st.session_state:
 
@@ -556,43 +548,31 @@ st.markdown(
 
 st.markdown("#### 🏢 เลือกสาขา")
 
-
 branches, branch_err = load_branch_list()
-
 
 if branch_err:
 
     st.markdown(
         f'<div class="error-box">'
         f'❌ โหลดรายชื่อสาขาไม่สำเร็จ: {branch_err}'
-        f'<br>ตรวจสอบว่ามี worksheet ชื่อ "รายชื่อสาขา" '
-        f'(หรือชื่อที่ตั้งใน secrets) '
-        f'และมีคอลัมน์หัวตาราง รหัส, รายชื่อสาขา, zone'
         f'</div>',
         unsafe_allow_html=True
     )
 
     sender_name, zone = "", ""
 
-
 elif not branches:
 
     st.markdown(
         '<div class="error-box">'
-        '⚠️ ยังไม่มีรายชื่อสาขาในชีท '
-        'กรุณาเพิ่มข้อมูลก่อนใช้งาน'
+        '⚠️ ยังไม่มีรายชื่อสาขาในชีท'
         '</div>',
         unsafe_allow_html=True
     )
 
     sender_name, zone = "", ""
 
-
 else:
-
-    # =====================================================
-    # ZONE
-    # =====================================================
 
     st.caption("📍 ขั้นที่ 1: เลือก Zone")
 
@@ -612,7 +592,6 @@ else:
         label_visibility="collapsed",
     )
 
-
     if picked_zone == "ทั้งหมด (ทุก Zone)":
 
         filtered_branches = branches
@@ -625,10 +604,10 @@ else:
             if b["zone"] == picked_zone
         ]
 
-
-    # =====================================================
-    # BRANCH SELECT
-    # =====================================================
+    st.caption(
+        f"🔎 ขั้นที่ 2: เลือกสาขา "
+        f"({len(filtered_branches)} สาขา)"
+    )
 
     def display_label(b):
 
@@ -637,12 +616,6 @@ else:
             return f'{b["code"]} | {b["name"]}'
 
         return b["name"]
-
-
-    st.caption(
-        f"🔎 ขั้นที่ 2: พิมพ์รหัสหรือชื่อเพื่อค้นหา/เลือกสาขา "
-        f"({len(filtered_branches)} สาขา)"
-    )
 
     branch_options = [
         "-- กรุณาเลือกสาขา --"
@@ -657,7 +630,6 @@ else:
         label_visibility="collapsed",
         key=f"branch_select_{picked_zone}",
     )
-
 
     if picked != "-- กรุณาเลือกสาขา --":
 
@@ -674,24 +646,16 @@ else:
 
         matched = None
 
-
     if matched:
 
         sender_name = matched["name"]
 
         zone = matched["zone"]
 
-        code_note = (
-            f' &nbsp;·&nbsp; รหัส: {matched["code"]}'
-            if matched["code"]
-            else ""
-        )
-
         st.markdown(
             f'<div class="branch-box">'
-            f'🏪 <strong>{matched["name"]}</strong> '
-            f'&nbsp;·&nbsp; Zone {matched["zone"] or "-"}'
-            f'{code_note}'
+            f'🏪 <strong>{matched["name"]}</strong>'
+            f' &nbsp;·&nbsp; Zone {matched["zone"] or "-"}'
             f'</div>',
             unsafe_allow_html=True
         )
@@ -713,8 +677,7 @@ st.markdown(
 st.markdown("#### 📦 เครื่องที่ขาด")
 
 st.caption(
-    'เลือก "ครบ" หรือเลือกเครื่องที่ขาดได้หลายเครื่อง '
-    '(เลือก "ครบ" แล้วจะเลือกเครื่องอื่นไม่ได้)'
+    'เลือก "ครบ" หรือเลือกเครื่องที่ขาดได้หลายเครื่อง'
 )
 
 
@@ -770,7 +733,6 @@ completeness_sel = st.multiselect(
     on_change=_enforce_completeness_exclusive,
 )
 
-
 if "ครบ" in completeness_sel:
 
     completeness = "ครบ"
@@ -782,7 +744,6 @@ elif completeness_sel:
 else:
 
     completeness = "-- กรุณาเลือก --"
-
 
 incomplete_reason = ", ".join(
     [
@@ -802,7 +763,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown("#### 📷 เลือกรูปภาพ (เลือกได้หลายรูปพร้อมกัน)")
+st.markdown("#### 📷 เลือกรูปภาพ")
 
 st.caption(
     "💡 กด Ctrl ค้างไว้แล้วคลิกเลือกหลายรูปพร้อมกัน"
@@ -845,16 +806,13 @@ if uploaded_files:
         '2. มีระยะห่างจากกันระหว่างบิล<br>'
         '3. ภาพเป็นแนวตั้ง '
         '(หากเป็นแนวนอนสามารถปรับหมุนได้)'
-        '<br><br>'
         '</div>',
         unsafe_allow_html=True
     )
 
-
     if "rotations" not in st.session_state:
 
         st.session_state.rotations = {}
-
 
     for i, f in enumerate(uploaded_files):
 
@@ -881,9 +839,7 @@ if uploaded_files:
             use_container_width=True
         )
 
-
         c1, c2, c3 = st.columns(3)
-
 
         with c1:
 
@@ -901,7 +857,6 @@ if uploaded_files:
 
                 st.rerun()
 
-
         with c2:
 
             if st.button(
@@ -918,7 +873,6 @@ if uploaded_files:
 
                 st.rerun()
 
-
         with c3:
 
             if st.button(
@@ -934,7 +888,6 @@ if uploaded_files:
                 ) % 360
 
                 st.rerun()
-
 
         st.markdown(
             '<hr class="divider">',
@@ -969,14 +922,12 @@ if uploaded_files:
 
         if not reporter_name.strip():
 
-            missing.append(
-                "ชื่อผู้กรอก"
-            )
+            missing.append("ชื่อผู้กรอก")
 
         if not sender_name.strip():
 
             missing.append(
-                "สาขา (กรุณาเลือกจากรายการ)"
+                "สาขา"
             )
 
         if completeness == "-- กรุณาเลือก --":
@@ -984,17 +935,6 @@ if uploaded_files:
             missing.append(
                 "เครื่องที่ขาด"
             )
-
-        if (
-            completeness == "ไม่ครบ"
-            and not incomplete_reason.strip()
-        ):
-
-            missing.append(
-                "เครื่องที่ขาด "
-                "(เลือกอย่างน้อย 1 เครื่อง)"
-            )
-
 
         if missing:
 
@@ -1013,11 +953,10 @@ if uploaded_files:
                 unsafe_allow_html=True
             )
 
-
         else:
 
             # =============================================
-            # START UPLOAD
+            # START
             # =============================================
 
             safe_sender = (
@@ -1036,21 +975,22 @@ if uploaded_files:
 
 
             # =============================================
-            # LOOP FILES
+            # LOOP
             # =============================================
 
             for idx, f in enumerate(
                 uploaded_files
             ):
 
+                result = {
+                    "filename": f.name,
+                    "cloud_ok": False,
+                    "sheet_ok": False,
+                    "cloud_url": "",
+                    "error": ""
+                }
+
                 try:
-
-                    # -------------------------------------
-                    # RESET FILE
-                    # -------------------------------------
-
-                    f.seek(0)
-
 
                     # -------------------------------------
                     # ROTATION
@@ -1087,7 +1027,7 @@ if uploaded_files:
 
 
                     # -------------------------------------
-                    # FILE NAME
+                    # UNIQUE FILE NAME
                     # -------------------------------------
 
                     ts_file = (
@@ -1104,8 +1044,13 @@ if uploaded_files:
                     )
 
 
+                    result["filename"] = (
+                        f"{fname}.jpg"
+                    )
+
+
                     # =====================================
-                    # CLOUDINARY
+                    # 1. CLOUDINARY
                     # =====================================
 
                     secure_url = (
@@ -1115,9 +1060,15 @@ if uploaded_files:
                         )
                     )
 
+                    result["cloud_ok"] = True
+
+                    result["cloud_url"] = (
+                        secure_url
+                    )
+
 
                     # =====================================
-                    # GOOGLE SHEET
+                    # 2. GOOGLE SHEET
                     # =====================================
 
                     status_label = (
@@ -1144,55 +1095,41 @@ if uploaded_files:
 
 
                     # =====================================
-                    # RESULT
+                    # SHEET SUCCESS
                     # =====================================
 
-                    results.append({
+                    if log_ok:
 
-                        "filename": fname,
+                        result["sheet_ok"] = True
 
-                        "cloud_ok": True,
+                        result["retry"] = (
+                            retry_count
+                        )
 
-                        "sheet_ok": log_ok,
 
-                        "sheet_retry": retry_count,
+                    # =====================================
+                    # SHEET FAILED
+                    # =====================================
 
-                        "size_kb": round(
-                            len(img_bytes) / 1024
-                        ),
+                    else:
 
-                        "dim": (
-                            f"{new_w}×{new_h}"
-                        ),
+                        result["sheet_ok"] = False
 
-                        "log_err": log_err,
+                        result["retry"] = (
+                            retry_count
+                        )
 
-                        "url": secure_url
-                    })
+                        result["error"] = (
+                            log_err
+                        )
 
 
                 except Exception as e:
 
-                    results.append({
+                    result["error"] = str(e)
 
-                        "filename": f.name,
 
-                        "cloud_ok": False,
-
-                        "sheet_ok": False,
-
-                        "sheet_retry": 0,
-
-                        "size_kb": 0,
-
-                        "dim": "-",
-
-                        "log_err": "",
-
-                        "err": str(e),
-
-                        "url": ""
-                    })
+                results.append(result)
 
 
                 # =========================================
@@ -1203,7 +1140,7 @@ if uploaded_files:
                     (idx + 1)
                     / len(uploaded_files),
                     text=(
-                        f"อัพโหลด "
+                        f"กำลังอัพโหลด "
                         f"{idx + 1}/"
                         f"{len(uploaded_files)}..."
                     )
@@ -1214,184 +1151,130 @@ if uploaded_files:
 
 
             # =================================================
-            # SUMMARY
+            # CHECK RESULT
             # =================================================
+
+            total = len(results)
 
             cloud_success = [
                 r
                 for r in results
-                if r.get("cloud_ok")
-            ]
-
-            cloud_fail = [
-                r
-                for r in results
-                if not r.get("cloud_ok")
+                if r["cloud_ok"]
             ]
 
             sheet_success = [
                 r
                 for r in results
                 if (
-                    r.get("cloud_ok")
-                    and r.get("sheet_ok")
+                    r["cloud_ok"]
+                    and r["sheet_ok"]
                 )
             ]
 
-            sheet_fail = [
+            rejected = [
                 r
                 for r in results
-                if (
-                    r.get("cloud_ok")
-                    and not r.get("sheet_ok")
-                )
+                if not r["sheet_ok"]
             ]
 
 
             # =================================================
-            # CLOUDINARY SUMMARY
+            # ALL SUCCESS
             # =================================================
-
-            if cloud_success:
-
-                lines = [
-                    "<strong>"
-                    f"☁️ Cloudinary สำเร็จ "
-                    f"{len(cloud_success)}/"
-                    f"{len(uploaded_files)} รูป"
-                    "</strong>"
-                ]
-
-                for r in cloud_success:
-
-                    lines.append(
-                        f"📄 {r['filename']}.jpg"
-                        f" · {r['dim']} px"
-                        f" · {r['size_kb']} KB"
-                    )
-
-                st.markdown(
-                    '<div class="success-box">'
-                    + "<br>".join(lines)
-                    + "</div>",
-                    unsafe_allow_html=True
-                )
-
-
-            # =================================================
-            # GOOGLE SHEET SUCCESS
-            # =================================================
-
-            if sheet_success:
-
-                st.markdown(
-                    '<div class="success-box">'
-                    f'<strong>📊 Google Sheet สำเร็จ '
-                    f'{len(sheet_success)}/'
-                    f'{len(uploaded_files)} รายการ</strong>'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
-
-
-            # =================================================
-            # GOOGLE SHEET FAILED
-            # =================================================
-
-            if sheet_fail:
-
-                lines = [
-                    "<strong>"
-                    "⚠️ Cloudinary สำเร็จ "
-                    "แต่ Google Sheet ไม่สำเร็จ"
-                    "</strong>"
-                ]
-
-                for r in sheet_fail:
-
-                    lines.append(
-                        f"• {r['filename']}.jpg"
-                        f" — ลอง {r['sheet_retry']} ครั้ง"
-                        f"<br>&nbsp;&nbsp;"
-                        f"Error: {r.get('log_err', '')}"
-                    )
-
-                st.markdown(
-                    '<div class="error-box">'
-                    + "<br>".join(lines)
-                    + "</div>",
-                    unsafe_allow_html=True
-                )
-
-
-            # =================================================
-            # CLOUDINARY FAILED
-            # =================================================
-
-            if cloud_fail:
-
-                lines = [
-                    "<strong>"
-                    f"❌ Cloudinary ไม่สำเร็จ "
-                    f"{len(cloud_fail)} รูป"
-                    "</strong>"
-                ]
-
-                for r in cloud_fail:
-
-                    lines.append(
-                        f"• {r['filename']}"
-                        f" — {r.get('err', '')}"
-                    )
-
-                st.markdown(
-                    '<div class="error-box">'
-                    + "<br>".join(lines)
-                    + "</div>",
-                    unsafe_allow_html=True
-                )
-
-
-            # =================================================
-            # FINAL STATUS
-            # =================================================
-
-            total = len(uploaded_files)
 
             if (
                 len(cloud_success) == total
                 and len(sheet_success) == total
             ):
 
-                # ทุกอย่างสำเร็จ
+                st.session_state.sent_count = (
+                    total
+                )
 
                 st.session_state.show_sent_dialog = True
-
-                st.session_state.sent_count = (
-                    len(sheet_success)
-                )
 
                 st.rerun()
 
 
-            elif sheet_fail or cloud_fail:
+            # =================================================
+            # REJECT
+            # =================================================
 
-                # มีบางส่วนล้มเหลว
+            else:
 
                 st.markdown(
-                    '<div class="warning-box">'
-                    '<strong>⚠️ งานยังไม่สมบูรณ์</strong>'
+                    '<div class="error-box">'
+                    '<strong>'
+                    '❌ ส่งข้อมูลไม่สำเร็จ'
+                    '</strong>'
                     '<br><br>'
-                    f'☁️ Cloudinary: '
-                    f'{len(cloud_success)}/{total}'
-                    '<br>'
-                    f'📊 Google Sheet: '
-                    f'{len(sheet_success)}/{total}'
+                    'ระบบไม่อนุญาตให้ยืนยันการส่ง '
+                    'เนื่องจากข้อมูลบางรายการ '
+                    'ไม่สามารถบันทึกลง Google Sheet ได้'
                     '<br><br>'
-                    'กรุณาตรวจสอบรายการที่มีเครื่องหมาย ❌ '
-                    'หรือ ⚠️ ด้านบน'
+                    'กรุณาส่งรูปใหม่อีกครั้ง'
                     '</div>',
                     unsafe_allow_html=True
+                )
+
+
+                # =============================================
+                # SHOW REJECTED FILES
+                # =============================================
+
+                if rejected:
+
+                    st.markdown(
+                        "### 📋 รายการที่ถูก Reject"
+                    )
+
+                    for r in rejected:
+
+                        if r["cloud_ok"]:
+
+                            st.markdown(
+                                f'<div class="warning-box">'
+                                f'📄 <strong>'
+                                f'{r["filename"]}'
+                                f'</strong>'
+                                f'<br>'
+                                f'☁️ Cloudinary: ✅'
+                                f'<br>'
+                                f'📊 Google Sheet: ❌'
+                                f'<br>'
+                                f'🔄 ลองส่ง Sheet '
+                                f'{r.get("retry", 3)} ครั้ง'
+                                f'<br>'
+                                f'⚠️ กรุณาส่งรูปใหม่'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+
+                        else:
+
+                            st.markdown(
+                                f'<div class="error-box">'
+                                f'📄 <strong>'
+                                f'{r["filename"]}'
+                                f'</strong>'
+                                f'<br>'
+                                f'☁️ Cloudinary: ❌'
+                                f'<br>'
+                                f'📊 Google Sheet: ❌'
+                                f'<br>'
+                                f'⚠️ กรุณาส่งรูปใหม่'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+
+
+                # =============================================
+                # IMPORTANT
+                # =============================================
+
+                st.warning(
+                    "⚠️ ข้อมูลชุดนี้ยังไม่ถือว่าส่งสำเร็จ "
+                    "กรุณาส่งรูปใหม่อีกครั้ง"
                 )
 
 
