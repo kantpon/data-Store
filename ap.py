@@ -93,6 +93,24 @@ def load_branch_list():
 # แทนที่จะยิงชนกันจน Google ปฏิเสธ (429) เกือบหมดแบบที่เจอตอนทดสอบ
 SHEET_WRITE_SEMAPHORE = threading.Semaphore(5)
 
+def _is_retryable_error(e: Exception) -> bool:
+    """
+    แยกว่า error นี้ควร retry ไหม ตามผัง:
+    - 429 (ชนโควตา), เน็ตหลุด/timeout, 5xx (ปัญหาฝั่ง Google ชั่วคราว) -> ควร retry
+    - อย่างอื่น (สิทธิ์ผิด, ไม่พบชีท/แท็บ, ฯลฯ) -> ไม่ต้อง retry เพราะยังไงก็ไม่สำเร็จ
+    """
+    # gspread.exceptions.APIError มี .response เป็น requests.Response ให้เช็ค status code ได้
+    status_code = getattr(getattr(e, "response", None), "status_code", None)
+    if status_code is not None:
+        return status_code == 429 or 500 <= status_code < 600
+
+    # ปัญหาเน็ต/connection/timeout ฝั่งเรา ควร retry ได้เหมือนกัน
+    err_type = type(e).__name__
+    if err_type in ("ConnectionError", "Timeout", "ConnectTimeout", "ReadTimeout"):
+        return True
+
+    return False  # ไม่รู้จัก error type นี้ -> ปลอดภัยไว้ก่อน ไม่ retry
+
 def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
     """
     บันทึกแถวข้อมูลลง Google Sheet ผ่าน Service Account (gspread)
@@ -100,8 +118,10 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
 
     ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
     จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
-    ถ้าเขียนไม่สำเร็จ จะลองใหม่อัตโนมัติสูงสุด max_retries ครั้ง โดยเว้นช่วงเพิ่มขึ้นเรื่อยๆ
-    ก่อนจะยอมแพ้และคืนค่า False พร้อม error message ล่าสุด
+
+    ถ้าเขียนไม่สำเร็จ จะดูก่อนว่า error ประเภทไหน:
+    - 429 / เน็ตหลุด / 5xx -> retry อัตโนมัติ (สูงสุด max_retries ครั้ง, รอเพิ่มขึ้นเรื่อยๆ)
+    - error อื่น (เช่น สิทธิ์ผิด, ไม่พบชีท) -> fail ทันที ไม่เสียเวลา retry เพราะยังไงก็ไม่สำเร็จ
 
     คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
     """
@@ -124,6 +144,10 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
                 return True, ""
             except Exception as e:
                 last_err = str(e)
+
+                if not _is_retryable_error(e):
+                    return False, f"Error ที่ retry ไปก็ไม่มีทางสำเร็จ: {last_err}"
+
                 if attempt < max_retries:
                     time.sleep(min(2 ** attempt, 30))  # รอ 2s, 4s, 8s, 16s, 30s ก่อนลองใหม่
 
