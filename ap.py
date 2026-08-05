@@ -4,6 +4,7 @@ import cloudinary.uploader
 import io
 import datetime
 import time
+import threading
 import gspread
 from google.oauth2.service_account import Credentials
 from PIL import Image, ImageOps
@@ -86,37 +87,45 @@ def load_branch_list():
     except Exception as e:
         return [], str(e)
 
-def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=3):
+# จำกัดจำนวนคนที่เขียนชีทพร้อมกันจริงๆ ในเซิร์ฟเวอร์เดียวกัน ไม่ให้ยิงชนกันหมดทีเดียว
+# (Streamlit รันหลาย session พร้อมกันในโปรเซสเดียว ตัวแปรนี้เลยคุมทุกคนที่ใช้แอปพร้อมกันได้จริง)
+# ถ้าคนส่งพร้อมกันเกิน 5 คน คนที่ 6 เป็นต้นไปจะ "รอคิว" สั้นๆ ก่อนได้เขียนจริง
+# แทนที่จะยิงชนกันจน Google ปฏิเสธ (429) เกือบหมดแบบที่เจอตอนทดสอบ
+SHEET_WRITE_SEMAPHORE = threading.Semaphore(5)
+
+def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
     """
     บันทึกแถวข้อมูลลง Google Sheet ผ่าน Service Account (gspread)
     ลำดับคอลัมน์: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
 
     ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
+    จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
     ถ้าเขียนไม่สำเร็จ จะลองใหม่อัตโนมัติสูงสุด max_retries ครั้ง โดยเว้นช่วงเพิ่มขึ้นเรื่อยๆ
-    (1s, 2s, 4s) ก่อนจะยอมแพ้และคืนค่า False พร้อม error message ล่าสุด
+    ก่อนจะยอมแพ้และคืนค่า False พร้อม error message ล่าสุด
 
     คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
     """
     ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     last_err = ""
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            worksheet = setup_gsheet()
+    with SHEET_WRITE_SEMAPHORE:  # รอคิวถ้ามีคนอื่นกำลังเขียนอยู่เกิน 5 คนพร้อมกัน
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
 
-            # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
-            # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
-            if filename:
-                existing_filenames = worksheet.col_values(7)  # คอลัมน์ G = ชื่อไฟล์
-                if filename in existing_filenames:
-                    return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
+                # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
+                # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
+                if filename:
+                    existing_filenames = worksheet.col_values(7)  # คอลัมน์ G = ชื่อไฟล์
+                    if filename in existing_filenames:
+                        return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
 
-            worksheet.append_row([ts, reporter, branch, zone, status, reason, filename, url])
-            return True, ""
-        except Exception as e:
-            last_err = str(e)
-            if attempt < max_retries:
-                time.sleep(2 ** (attempt - 1))  # รอ 1s, 2s, 4s ก่อนลองใหม่
+                worksheet.append_row([ts, reporter, branch, zone, status, reason, filename, url])
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 30))  # รอ 2s, 4s, 8s, 16s, 30s ก่อนลองใหม่
 
     return False, f"พยายามบันทึก {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
 
@@ -166,12 +175,17 @@ def delete_from_cloudinary(public_id):
     """
     ลบรูปออกจาก Cloudinary (ใช้ตอน rollback เมื่อบันทึกชีทไม่สำเร็จ
     เพื่อไม่ให้เหลือ "รูปกำพร้า" ที่มีในคลาวแต่ไม่มีในชีท)
-    คืน True ถ้าลบสำเร็จ, False ถ้าลบไม่สำเร็จ
+    คืน True ถ้าลบสำเร็จ, False ถ้าลบไม่สำเร็จ (พร้อม print เหตุผลไว้ให้เช็คได้)
     """
     try:
-        cloudinary.uploader.destroy(public_id, resource_type="image")
+        result = cloudinary.uploader.destroy(public_id, resource_type="image", invalidate=True)
+        # Cloudinary จะตอบ {"result": "ok"} ถ้าลบสำเร็จจริง, "not found" ถ้าไม่เจอไฟล์
+        if result.get("result") != "ok":
+            print(f"CLOUDINARY DELETE FAILED: {public_id} -> {result}")
+            return False
         return True
-    except Exception:
+    except Exception as e:
+        print(f"CLOUDINARY DELETE ERROR: {public_id} -> {e}")
         return False
 
 setup_cloudinary()
