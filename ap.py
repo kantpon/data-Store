@@ -1,6 +1,5 @@
 import streamlit as st
 import cloudinary
-import cloudinary.api
 import cloudinary.uploader
 import io
 import datetime
@@ -155,6 +154,30 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
 
     return False, f"พยายามบันทึก {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
 
+
+def update_sheet_image_url(filename, url, max_retries=5):
+    """ใส่ลิงก์ Cloudinary ในคอลัมน์ H ของแถวที่สร้างไว้แล้ว."""
+    last_err = ""
+
+    with SHEET_WRITE_SEMAPHORE:
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
+                cells = worksheet.findall(filename, in_column=7)
+                if not cells:
+                    return False, f"หาแถวของไฟล์ {filename} ไม่พบ"
+
+                worksheet.update_cell(cells[-1].row, 8, url)
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                if not _is_retryable_error(e):
+                    return False, last_err
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 30))
+
+    return False, f"อัปเดตลิงก์รูปไม่สำเร็จ: {last_err}"
+
 def fix_orientation(file, thumb_side: int = 500, extra_rotation: int = 0):
     """เปิดรูป หมุนตาม EXIF ให้ถูกทาง + หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
     img = Image.open(file)
@@ -183,50 +206,21 @@ def compress_image(file, max_side: int = 1280, quality: int = 78, extra_rotation
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue(), img.width, img.height
 
-def upload_to_cloudinary(image_bytes, filename, receipt_data):
+def upload_to_cloudinary(image_bytes, filename):
     """
     อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
     """
-    # เก็บข้อมูลที่จำเป็นไว้กับรูปด้วยเสมอ เพื่อให้กู้รายการกลับเข้า Sheet
-    # ได้หากเซิร์ฟเวอร์หยุดทำงานหลังอัปโหลดสำเร็จ แต่ก่อน append_row สำเร็จ
     result = cloudinary.uploader.upload(
         image_bytes,
         folder="branch",
         public_id=filename,
         resource_type="image",
         overwrite=False,
-        context=receipt_data,
     )
     secure_url = result.get("secure_url", "")
     if not secure_url:
         raise RuntimeError("Cloudinary อัปโหลดสำเร็จแต่ไม่ได้คืนลิงก์รูป")
     return secure_url
-
-
-def restore_receipt_from_cloudinary(public_id):
-    """กู้ 1 รูปที่ค้างใน Cloudinary กลับเข้า Google Sheet โดยไม่ยุ่งกับ UI.
-
-    ใช้จาก console/admin script: restore_receipt_from_cloudinary('branch/<public_id>')
-    รูปที่อัปโหลดหลังโค้ดนี้จะมี context ครบสำหรับกู้คืนเสมอ.
-    """
-    asset = cloudinary.api.resource(public_id, resource_type="image", context=True)
-    data = asset.get("context", {}).get("custom", {})
-    required = ("reporter", "branch", "zone", "status", "reason", "filename")
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise ValueError(f"รูปนี้ไม่มีข้อมูลสำรองสำหรับกู้คืน: {', '.join(missing)}")
-
-    return log_to_sheet(
-        reporter=data["reporter"],
-        branch=data["branch"],
-        zone=data["zone"],
-        status=data["status"],
-        reason=data["reason"],
-        filename=data["filename"],
-        url=asset.get("secure_url", ""),
-    )
-
-
 def delete_from_cloudinary(public_id):
     """
     ลบรูปออกจาก Cloudinary (ใช้ตอน rollback เมื่อบันทึกชีทไม่สำเร็จ
@@ -504,55 +498,45 @@ if uploaded_files:
                     fname = f"{safe_sender}_{ts_file}_{idx+1}_{receipt_id[:12]}"
                     sheet_filename = f"{fname}.jpg"
 
-                    # Context นี้เป็นข้อมูลสำรองที่อยู่กับไฟล์บน Cloudinary โดยไม่กระทบ UI
-                    # ถ้า Google Sheet ขัดข้องหรือแอปหยุดกลางทาง แอดมินกู้กลับได้ด้วย
-                    # restore_receipt_from_cloudinary("branch/<public_id>")
-                    receipt_data = {
-                        "receipt_id": receipt_id,
-                        "reporter": reporter_name.strip(),
-                        "branch": sender_name.strip(),
-                        "zone": zone.strip(),
-                        "status": status_label,
-                        "reason": incomplete_reason.strip() or "-",
-                        "filename": sheet_filename,
-                    }
-                    secure_url = upload_to_cloudinary(img_bytes, fname, receipt_data)
-
-                    log_ok, log_err = log_to_sheet(
+                    # สร้างแถวใน Sheet ก่อนเสมอ: จึงไม่มีรูปใหม่ใน Cloudinary
+                    # ที่ไม่มีข้อมูลประกอบใน Sheet แม้ Cloudinary/แอปจะขัดข้องภายหลัง
+                    sheet_ok, sheet_err = log_to_sheet(
                         reporter=reporter_name.strip(),
                         branch=sender_name.strip(),
                         zone=zone.strip(),
                         status=status_label,
                         reason=incomplete_reason.strip(),
                         filename=sheet_filename,
-                        url=secure_url,
+                        url="",
                     )
 
-                    if log_ok:
-                        results.append({
-                            "filename": fname,
-                            "ok": True,
-                            "size_kb": round(len(img_bytes) / 1024),
-                            "dim": f"{new_w}×{new_h}",
-                        })
-                    else:
-                        # พยายาม rollback แต่หากลบไม่สำเร็จ รูปยังมี context ครบสำหรับกู้คืน
-                        # (เดิมไม่ตรวจผลลบ ทำให้รูปกำพร้าถูกทิ้งไว้โดยกู้ข้อมูลไม่ได้)
-                        deleted = delete_from_cloudinary(f"branch/{fname}")
-                        if not deleted:
-                            print(
-                                f"SHEET SYNC REQUIRED: branch/{fname} "
-                                f"(receipt_id={receipt_id})"
-                            )
+                    if not sheet_ok:
                         results.append({
                             "filename": fname,
                             "ok": False,
-                            "detail": (
-                                f"บันทึกลง Google Sheet ไม่สำเร็จ: {log_err}"
-                                if deleted else
-                                f"บันทึกลง Google Sheet ไม่สำเร็จ และต้องกู้จาก Cloudinary: {log_err}"
-                            ),
+                            "detail": f"บันทึกลง Google Sheet ไม่สำเร็จ: {sheet_err}",
                         })
+                    else:
+                        secure_url = upload_to_cloudinary(img_bytes, fname)
+                        url_ok, url_err = update_sheet_image_url(sheet_filename, secure_url)
+
+                        if not url_ok:
+                            print(
+                                f"IMAGE URL SYNC REQUIRED: filename={sheet_filename}, "
+                                f"url={secure_url}, error={url_err}"
+                            )
+                            results.append({
+                                "filename": fname,
+                                "ok": False,
+                                "detail": f"อัปโหลดรูปสำเร็จ แต่ใส่ลิงก์ลง Sheet ไม่สำเร็จ: {url_err}",
+                            })
+                        else:
+                            results.append({
+                                "filename": fname,
+                                "ok": True,
+                                "size_kb": round(len(img_bytes) / 1024),
+                                "dim": f"{new_w}×{new_h}",
+                            })
                 except Exception as e:
                     results.append({"filename": f.name, "ok": False, "detail": str(e)})
 
@@ -576,7 +560,7 @@ if uploaded_files:
 
                 st.markdown(
                     f'<div class="error-box"><strong>❌ ไม่สำเร็จ {len(fail)} รูป โปรดลองอัพโหลดใหม่อีกครั้ง</strong>'
-                    f'<br>(ระบบจะพยายามลบรูปที่บันทึกชีทไม่ผ่านโดยอัตโนมัติ หากลบไม่สำเร็จ ผู้ดูแลสามารถกู้ข้อมูลจาก Cloudinary ได้)</div>',
+                    f'<br>(ข้อมูลถูกบันทึกใน Google Sheet ก่อนอัปโหลดรูป จึงไม่เกิดกรณีมีรูปแต่ไม่มีข้อมูลในชีต)</div>',
                     unsafe_allow_html=True,
                 )
 
