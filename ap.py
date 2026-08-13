@@ -1,110 +1,63 @@
-def show_success_dialog():
-                    fname = f"{safe_sender}_{ts_file}_{idx+1}_{receipt_id[:12]}"
-                    sheet_filename = f"{fname}.jpg"
+import streamlit as st
+import streamlit as st
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+import io
+import datetime
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue(), img.width, img.height
 
-                    # สร้างข้อมูลก่อนเสมอ: ถ้า Sheet ไม่พร้อม จะยังไม่อัปโหลดรูป
-                    sheet_ok, sheet_err = log_to_sheet(
-                        reporter=reporter_name.strip(),
-                        branch=sender_name.strip(),
-                        zone=zone.strip(),
-                        status=status_label,
-                        reason=incomplete_reason.strip(),
-                        filename=sheet_filename,
-                        url="",
-                    )
-                    # อัปโหลดรูปพร้อมข้อมูลสำรองก่อน เพื่อรักษารูปไว้แม้ Sheet ขัดข้อง
-                    receipt_data = {
-                        "receipt_id": receipt_id,
-                        "reporter": reporter_name.strip(),
-                        "branch": sender_name.strip(),
-                        "zone": zone.strip(),
-                        "status": status_label,
-                        "reason": incomplete_reason.strip() or "-",
-                        "filename": sheet_filename,
-                    }
-                    upload_result = upload_to_cloudinary(img_bytes, fname, receipt_data)
-
-                    if not sheet_ok:
-                    # พยายาม sync ทันที; ถ้าไม่ผ่าน รูปจะคงแท็ก receipt_sync_pending
-                    # และจะถูกลอง sync ใหม่เมื่อมีคนเปิดแอปครั้งถัดไป
-                    sync_ok, sync_err = sync_receipt_from_cloudinary(
-                        upload_result["public_id"], upload_result
-                    )
-                    if sync_ok:
-                        results.append({
-                            "filename": fname,
-                            "ok": False,
-                            "detail": f"บันทึกลง Google Sheet ไม่สำเร็จ: {sheet_err}",
-                            "ok": True,
-                            "size_kb": round(len(img_bytes) / 1024),
-                            "dim": f"{new_w}×{new_h}",
-                        })
-                    else:
-                        # O=PENDING ก่อนเริ่มอัปโหลด เพื่อให้ตามงานที่ค้างได้จากชีต
-                        pending_ok, pending_err = update_receipt_sync(
-                            sheet_filename, sync_status="PENDING"
-                        print(
-                            f"PENDING RECEIPT: {upload_result['public_id']} -> {sync_err}"
-                        )
-                        if not pending_ok:
-                            print(
-                                f"SYNC STATUS REQUIRED: filename={sheet_filename}, "
-                                f"error={pending_err}"
-                            )
-                            results.append({
-                                "filename": fname,
-                                "ok": False,
-                                "detail": f"ตั้งสถานะ SyncQueue ไม่สำเร็จ: {pending_err}",
-                            })
-                        else:
-                            try:
-                                secure_url = upload_to_cloudinary(img_bytes, fname)
-                            except Exception as upload_err:
-                                update_receipt_sync(
-                                    sheet_filename, sync_status="UPLOAD_FAILED"
-                                )
-                                results.append({
-                                    "filename": fname,
-                                    "ok": False,
-                                    "detail": f"อัปโหลดรูปไม่สำเร็จ: {upload_err}",
-                                })
-                            else:
-                                done_ok, done_err = update_receipt_sync(
-                                    sheet_filename,
-                                    url=secure_url,
-                                    sync_status="DONE",
-                                )
-                                if done_ok:
-                                    results.append({
-                                        "filename": fname,
-                                        "ok": True,
-                                        "size_kb": round(len(img_bytes) / 1024),
-                                        "dim": f"{new_w}×{new_h}",
-                                    })
-                                else:
-                                    # รูปและแถวมีอยู่แล้ว แต่ SyncQueue ยังค้าง PENDING
-                                    # ผู้ดูแลค้นหา PENDING ในคอลัมน์ O เพื่อตามรายการนี้ได้
-                                    print(
-                                        f"IMAGE URL SYNC REQUIRED: filename={sheet_filename}, "
-                                        f"url={secure_url}, error={done_err}"
-                                    )
-                                    results.append({
-                                        "filename": fname,
-                                        "ok": False,
-                                        "detail": f"อัปโหลดรูปสำเร็จ แต่เติมลิงก์/SyncQueue ไม่สำเร็จ: {done_err}",
-                                    })
-                        results.append({
-                            "filename": fname,
-                            "ok": False,
-                            "detail": f"เก็บรูปแล้ว แต่ sync Google Sheet ยังไม่สำเร็จ: {sync_err}",
-                        })
-                except Exception as e:
-                    results.append({"filename": f.name, "ok": False, "detail": str(e)})
+def upload_to_cloudinary(image_bytes, filename):
+def upload_to_cloudinary(image_bytes, filename, receipt_data):
+    """
+    อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
+    """
+        public_id=filename,
+        resource_type="image",
+        overwrite=False,
+        tags=["receipt_sync_pending"],
+        context=receipt_data,
+    )
+    secure_url = result.get("secure_url", "")
+    if not secure_url:
+    if not result.get("secure_url") or not result.get("public_id"):
+        raise RuntimeError("Cloudinary อัปโหลดสำเร็จแต่ไม่ได้คืนลิงก์รูป")
+    return secure_url
+    return result
 
 
-                st.markdown(
-                    f'<div class="error-box"><strong>❌ ไม่สำเร็จ {len(fail)} รูป โปรดลองอัพโหลดใหม่อีกครั้ง</strong>'
-                    f'<br>(ตรวจสอบรายการค้างได้จากคอลัมน์ SyncQueue: PENDING หรือ UPLOAD_FAILED)</div>',
-                    f'<br>(หาก Google Sheet ขัดข้องหลังอัปโหลด รูปจะถูกเก็บไว้และระบบจะลอง sync ใหม่อัตโนมัติ)</div>',
-                    unsafe_allow_html=True,
-                )
+def sync_receipt_from_cloudinary(public_id, asset=None):
+    """เขียนรูปที่ติดแท็ก pending กลับเข้า Sheet แล้วปิดงานเมื่อครบทั้งสองฝั่ง."""
+    asset = asset or cloudinary.api.resource(public_id, resource_type="image", context=True)
+    data = asset.get("context", {}).get("custom", {})
+    if not data:
+        # upload response อาจไม่คืน context จึงอ่านข้อมูลจริงจาก Admin API อีกครั้ง
+        asset = cloudinary.api.resource(public_id, resource_type="image", context=True)
+        data = asset.get("context", {}).get("custom", {})
+    required = ("reporter", "branch", "zone", "status", "reason", "filename")
+    missing = [key for key in required if key not in data]
+    if missing:
+        return False, f"รูปไม่มีข้อมูลสำรอง: {', '.join(missing)}"
+
+    sheet_ok, sheet_err = log_to_sheet(
+        reporter=data["reporter"], branch=data["branch"], zone=data["zone"],
+        status=data["status"], reason=data["reason"],
+        filename=data["filename"], url="",
+    )
+    if not sheet_ok:
+        return False, sheet_err
+
+    pending_ok, pending_err = update_receipt_sync(data["filename"], sync_status="PENDING")
+    if not pending_ok:
+        return False, pending_err
+
+    done_ok, done_err = update_receipt_sync(
+        data["filename"], url=asset.get("secure_url", ""), sync_status="DONE"
+    )
+    if not done_ok:
+        return False, done_err
+
+    cloudinary.uploader.remove_tag("receipt_sync_pending", [public_id], resource_type="image")
+    return True, ""
+
