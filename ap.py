@@ -1,10 +1,12 @@
 import streamlit as st
 import cloudinary
+import cloudinary.api
 import cloudinary.uploader
 import io
 import datetime
 import time
 import threading
+import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 from PIL import Image, ImageOps
@@ -181,18 +183,48 @@ def compress_image(file, max_side: int = 1280, quality: int = 78, extra_rotation
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue(), img.width, img.height
 
-def upload_to_cloudinary(image_bytes, filename):
+def upload_to_cloudinary(image_bytes, filename, receipt_data):
     """
     อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
     """
+    # เก็บข้อมูลที่จำเป็นไว้กับรูปด้วยเสมอ เพื่อให้กู้รายการกลับเข้า Sheet
+    # ได้หากเซิร์ฟเวอร์หยุดทำงานหลังอัปโหลดสำเร็จ แต่ก่อน append_row สำเร็จ
     result = cloudinary.uploader.upload(
         image_bytes,
         folder="branch",
         public_id=filename,
         resource_type="image",
         overwrite=False,
+        context=receipt_data,
     )
-    return result.get("secure_url", "")
+    secure_url = result.get("secure_url", "")
+    if not secure_url:
+        raise RuntimeError("Cloudinary อัปโหลดสำเร็จแต่ไม่ได้คืนลิงก์รูป")
+    return secure_url
+
+
+def restore_receipt_from_cloudinary(public_id):
+    """กู้ 1 รูปที่ค้างใน Cloudinary กลับเข้า Google Sheet โดยไม่ยุ่งกับ UI.
+
+    ใช้จาก console/admin script: restore_receipt_from_cloudinary('branch/<public_id>')
+    รูปที่อัปโหลดหลังโค้ดนี้จะมี context ครบสำหรับกู้คืนเสมอ.
+    """
+    asset = cloudinary.api.resource(public_id, resource_type="image", context=True)
+    data = asset.get("context", {}).get("custom", {})
+    required = ("reporter", "branch", "zone", "status", "reason", "filename")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"รูปนี้ไม่มีข้อมูลสำรองสำหรับกู้คืน: {', '.join(missing)}")
+
+    return log_to_sheet(
+        reporter=data["reporter"],
+        branch=data["branch"],
+        zone=data["zone"],
+        status=data["status"],
+        reason=data["reason"],
+        filename=data["filename"],
+        url=asset.get("secure_url", ""),
+    )
 
 
 def delete_from_cloudinary(public_id):
@@ -464,18 +496,35 @@ if uploaded_files:
                     extra_rot = st.session_state.get("rotations", {}).get(rot_key, 0)
                     img_bytes, new_w, new_h = compress_image(f, max_side=1280, quality=78, extra_rotation=extra_rot)
 
-                    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fname = f"{safe_sender}_{ts_file}_{idx+1}"
-                    secure_url = upload_to_cloudinary(img_bytes, fname)
-
                     status_label = "ครบ" if completeness == "ครบ" else "ไม่ครบ"
+                    # เวลาอย่างเดียว (ความละเอียดเป็นวินาที) ชนกันได้เมื่อมีผู้ใช้งานพร้อมกัน
+                    # จึงใส่ UUID ลงในชื่อไฟล์และใช้ชื่อเดียวกันตลอดทั้ง Cloudinary/Sheet
+                    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    receipt_id = uuid.uuid4().hex
+                    fname = f"{safe_sender}_{ts_file}_{idx+1}_{receipt_id[:12]}"
+                    sheet_filename = f"{fname}.jpg"
+
+                    # Context นี้เป็นข้อมูลสำรองที่อยู่กับไฟล์บน Cloudinary โดยไม่กระทบ UI
+                    # ถ้า Google Sheet ขัดข้องหรือแอปหยุดกลางทาง แอดมินกู้กลับได้ด้วย
+                    # restore_receipt_from_cloudinary("branch/<public_id>")
+                    receipt_data = {
+                        "receipt_id": receipt_id,
+                        "reporter": reporter_name.strip(),
+                        "branch": sender_name.strip(),
+                        "zone": zone.strip(),
+                        "status": status_label,
+                        "reason": incomplete_reason.strip() or "-",
+                        "filename": sheet_filename,
+                    }
+                    secure_url = upload_to_cloudinary(img_bytes, fname, receipt_data)
+
                     log_ok, log_err = log_to_sheet(
                         reporter=reporter_name.strip(),
                         branch=sender_name.strip(),
                         zone=zone.strip(),
                         status=status_label,
                         reason=incomplete_reason.strip(),
-                        filename=f"{fname}.jpg",
+                        filename=sheet_filename,
                         url=secure_url,
                     )
 
@@ -487,12 +536,22 @@ if uploaded_files:
                             "dim": f"{new_w}×{new_h}",
                         })
                     else:
-                        # บันทึกชีทไม่ผ่าน -> ลบรูปออกจาก Cloudinary กันไม่ให้เหลือรูปกำพร้า
-                        delete_from_cloudinary(f"branch/{fname}")
+                        # พยายาม rollback แต่หากลบไม่สำเร็จ รูปยังมี context ครบสำหรับกู้คืน
+                        # (เดิมไม่ตรวจผลลบ ทำให้รูปกำพร้าถูกทิ้งไว้โดยกู้ข้อมูลไม่ได้)
+                        deleted = delete_from_cloudinary(f"branch/{fname}")
+                        if not deleted:
+                            print(
+                                f"SHEET SYNC REQUIRED: branch/{fname} "
+                                f"(receipt_id={receipt_id})"
+                            )
                         results.append({
                             "filename": fname,
                             "ok": False,
-                            "detail": f"บันทึกลง Google Sheet ไม่สำเร็จ: {log_err}",
+                            "detail": (
+                                f"บันทึกลง Google Sheet ไม่สำเร็จ: {log_err}"
+                                if deleted else
+                                f"บันทึกลง Google Sheet ไม่สำเร็จ และต้องกู้จาก Cloudinary: {log_err}"
+                            ),
                         })
                 except Exception as e:
                     results.append({"filename": f.name, "ok": False, "detail": str(e)})
@@ -517,7 +576,7 @@ if uploaded_files:
 
                 st.markdown(
                     f'<div class="error-box"><strong>❌ ไม่สำเร็จ {len(fail)} รูป โปรดลองอัพโหลดใหม่อีกครั้ง</strong>'
-                    f'<br>(รูปที่อัพโหลดแล้วแต่บันทึกชีทไม่ผ่าน ถูกลบออกจาก Cloudinary ให้อัตโนมัติแล้ว ไม่ต้องกังวลเรื่องรูปค้าง)</div>',
+                    f'<br>(ระบบจะพยายามลบรูปที่บันทึกชีทไม่ผ่านโดยอัตโนมัติ หากลบไม่สำเร็จ ผู้ดูแลสามารถกู้ข้อมูลจาก Cloudinary ได้)</div>',
                     unsafe_allow_html=True,
                 )
 
