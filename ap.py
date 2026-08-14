@@ -93,7 +93,9 @@ def load_branch_list():
 # (Streamlit รันหลาย session พร้อมกันในโปรเซสเดียว ตัวแปรนี้เลยคุมทุกคนที่ใช้แอปพร้อมกันได้จริง)
 # ถ้าคนส่งพร้อมกันเกิน 5 คน คนที่ 6 เป็นต้นไปจะ "รอคิว" สั้นๆ ก่อนได้เขียนจริง
 # แทนที่จะยิงชนกันจน Google ปฏิเสธ (429) เกือบหมดแบบที่เจอตอนทดสอบ
-SHEET_WRITE_SEMAPHORE = threading.Semaphore(5)
+# ต้องเขียนทีละรายการ เพราะหาแถวถัดไปจากคอลัมน์ G ก่อนเขียน
+# ถ้าเขียนพร้อมกันอาจเลือกแถวเดียวกันและข้อมูลทับกันได้
+SHEET_WRITE_SEMAPHORE = threading.Semaphore(1)
 SYNC_STATUS_COLUMN = 15  # คอลัมน์ O: SyncQueue
 
 def _is_retryable_error(e: Exception) -> bool:
@@ -138,12 +140,19 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
 
                 # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
                 # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
-                if filename:
-                    existing_filenames = worksheet.col_values(7)  # คอลัมน์ G = ชื่อไฟล์
-                    if filename in existing_filenames:
-                        return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
+                # ห้ามใช้ append_row(): เมื่อชีตมีสูตร/ข้อมูลด้านขวา Google อาจ
+                # เลือกจุดเริ่มตารางผิดและไปเพิ่มข้อมูลที่คอลัมน์ P เป็นต้นไป
+                # ระบุตำแหน่ง A:H เองจากแถวสุดท้ายของชื่อไฟล์ในคอลัมน์ G เสมอ
+                existing_filenames = worksheet.col_values(7)
+                if filename and filename in existing_filenames:
+                    return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
 
-                worksheet.append_row([ts, reporter, branch, zone, status, reason, filename, url])
+                next_row = len(existing_filenames) + 1
+                worksheet.update(
+                    f"A{next_row}:H{next_row}",
+                    [[ts, reporter, branch, zone, status, reason, filename, url]],
+                    value_input_option="USER_ENTERED",
+                )
                 return True, ""
             except Exception as e:
                 last_err = str(e)
@@ -457,7 +466,8 @@ if uploaded_files:
         '<br><br>'
         '1. ภาพชัดให้อ่านค่าได้<br>'
         '2. มีระยะห่างจากกันระหว่างบิล<br>'
-        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br><br>'
+        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br>'
+        '<br>'
         '⏳ <strong>โปรดรอจนกว่าจะขึ้น “ส่งข้อมูลสำเร็จ” ก่อนปิดหน้าเว็บ</strong><br><br>'
 
         '</div>',
