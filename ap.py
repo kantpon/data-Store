@@ -17,11 +17,17 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap');
     html, body, [class*="css"] { font-family: 'Sarabun', sans-serif; }
-    .stApp { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
-    .block-container { background: white; border-radius: 20px; padding: 2.5rem 2rem !important; margin-top: 2rem; box-shadow: 0 20px 60px rgba(0,0,0,0.15); max-width: 680px; }
-    h1 { color: #1a1a2e !important; font-weight: 700 !important; text-align: center; }
-    .subtitle { text-align: center; color: #6b7280; margin-top: -0.5rem; margin-bottom: 1.5rem; font-size: 1rem; }
-    .stButton > button { background: linear-gradient(135deg, #667eea, #764ba2) !important; color: white !important; border: none !important; border-radius: 12px !important; padding: 0.75rem 2rem !important; font-size: 1.1rem !important; font-weight: 600 !important; width: 100%; }
+    .stApp { background: radial-gradient(circle at 15% 0%, #dff7ff 0%, transparent 35%), linear-gradient(145deg, #eef5ff 0%, #f8fbff 52%, #e8f8f4 100%); min-height: 100vh; }
+    .block-container { background: rgba(255,255,255,0.96); border: 1px solid rgba(148,163,184,0.22); border-radius: 28px; padding: 2.2rem 2.3rem 2.8rem !important; margin-top: 1.8rem; margin-bottom: 2rem; box-shadow: 0 24px 70px rgba(30,64,175,0.13); max-width: 720px; }
+    h1 { color: #102a43 !important; font-weight: 700 !important; text-align: center; letter-spacing: -0.03em; }
+    .subtitle { text-align: center; color: #64748b; margin-top: -0.5rem; margin-bottom: 1.5rem; font-size: 1rem; }
+    .stButton > button { background: linear-gradient(135deg, #0f766e, #2563eb) !important; color: white !important; border: none !important; border-radius: 14px !important; padding: 0.8rem 2rem !important; font-size: 1.08rem !important; font-weight: 700 !important; width: 100%; box-shadow: 0 8px 18px rgba(37,99,235,0.2); transition: transform .15s ease, box-shadow .15s ease; }
+    .stButton > button:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgba(37,99,235,0.28); }
+    .hero-badge { width: fit-content; margin: 0 auto .7rem; padding: .35rem .8rem; border-radius: 999px; background: #e0f2fe; color: #0369a1; font-size: .82rem; font-weight: 700; }
+    .section-title { color: #102a43; font-weight: 700; font-size: 1.08rem; margin: .7rem 0 .25rem; }
+    .brand-box { background: linear-gradient(135deg, #eff6ff, #ecfeff); border: 1px solid #bae6fd; border-radius: 16px; padding: .7rem 1rem .2rem; margin: .35rem 0 .4rem; }
+    [data-testid="stFileUploader"] { border: 1.5px dashed #93c5fd; border-radius: 16px; background: #f8fbff; padding: .4rem; }
+    div[data-baseweb="select"] > div { border-radius: 12px; }
     .success-box { background: #f0fdf4; border: 2px solid #86efac; border-radius: 14px; padding: 1.2rem 1.5rem; color: #166534; margin-top: 1rem; }
     .error-box { background: #fef2f2; border: 2px solid #fca5a5; border-radius: 14px; padding: 1.2rem 1.5rem; color: #991b1b; margin-top: 1rem; }
     .branch-box { background: #eef2ff; border: 2px solid #c7d2fe; border-radius: 14px; padding: 1rem 1.2rem; color: #3730a3; margin-top: 0.6rem; }
@@ -97,6 +103,7 @@ def load_branch_list():
 # ถ้าเขียนพร้อมกันอาจเลือกแถวเดียวกันและข้อมูลทับกันได้
 SHEET_WRITE_SEMAPHORE = threading.Semaphore(1)
 SYNC_STATUS_COLUMN = 15  # คอลัมน์ O: SyncQueue
+BRAND_COLUMN = 13  # คอลัมน์ M: แบรนด์ (เว้นคอลัมน์สูตรเดิม I-L)
 
 def _is_retryable_error(e: Exception) -> bool:
     """
@@ -116,10 +123,11 @@ def _is_retryable_error(e: Exception) -> bool:
 
     return False  # ไม่รู้จัก error type นี้ -> ปลอดภัยไว้ก่อน ไม่ retry
 
-def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
+def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", brand="", max_retries=5):
     """
     บันทึกแถวข้อมูลลง Google Sheet ผ่าน Service Account (gspread)
-    ลำดับคอลัมน์: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
+    ลำดับคอลัมน์หลัก: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
+    คอลัมน์ M: แบรนด์, คอลัมน์ O: SyncQueue
 
     ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
     จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
@@ -153,6 +161,8 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
                     [[ts, reporter, branch, zone, status, reason, filename, url]],
                     value_input_option="USER_ENTERED",
                 )
+                if brand:
+                    worksheet.update_cell(next_row, BRAND_COLUMN, brand)
                 return True, ""
             except Exception as e:
                 last_err = str(e)
@@ -259,7 +269,7 @@ def sync_receipt_from_cloudinary(public_id, asset=None):
     sheet_ok, sheet_err = log_to_sheet(
         reporter=data["reporter"], branch=data["branch"], zone=data["zone"],
         status=data["status"], reason=data["reason"],
-        filename=data["filename"], url="",
+        filename=data["filename"], url="", brand=data.get("brand", ""),
     )
     if not sheet_ok:
         return False, sheet_err
@@ -330,13 +340,20 @@ def show_success_dialog():
         st.session_state.show_sent_dialog = False
         st.rerun()
 
+st.markdown('<div class="hero-badge">SECURE RECEIPT UPLOAD</div>', unsafe_allow_html=True)
 st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
-mode = st.radio("โหมด", [ "2 ใบเสร็จ"], label_visibility="collapsed")
-num_receipts = int(mode[0])
+# ── แบรนด์ (เลือกได้ 1 รายการ) ──
+st.markdown("#### 🏷️ แบรนด์")
+st.markdown('<div class="brand-box">เลือกแบรนด์ของใบเสร็จให้ตรงกับรายการที่กำลังส่ง</div>', unsafe_allow_html=True)
+brand_options = ["-- กรุณาเลือกแบรนด์ --", "CJ", "MiniBig", "C Test"]
+brand = st.selectbox(
+    "เลือกแบรนด์",
+    brand_options,
+    label_visibility="collapsed",
+)
 
 # ── ชื่อผู้กรอก (พิมพ์เอง) ──
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -508,6 +525,8 @@ if uploaded_files:
         missing = []
         if not reporter_name.strip():
             missing.append("ชื่อผู้กรอก")
+        if brand == "-- กรุณาเลือกแบรนด์ --":
+            missing.append("แบรนด์")
         if not sender_name.strip():
             missing.append("สาขา (กรุณาเลือกจากรายการ)")
         if completeness == "-- กรุณาเลือก --":
@@ -525,37 +544,12 @@ if uploaded_files:
             )
             missing = ["__debounce__"]  # กันไม่ให้ทำงานต่อในรอบนี้
 
-        # ── กันส่งซ้ำชุดเดิม (สาขา/ผู้กรอก/จำนวนรูปเดียวกัน ภายในไม่กี่นาที) ──
-        submit_sig = f"{sender_name.strip()}|{reporter_name.strip()}|{completeness}|{len(uploaded_files)}"
-        last_sig = st.session_state.get("last_submit_sig")
-        last_sig_time = st.session_state.get("last_submit_sig_time")
-        is_possible_duplicate = (
-            not missing
-            and last_sig == submit_sig
-            and last_sig_time
-            and (now - last_sig_time).total_seconds() < 300  # 5 นาที
-        )
-
-        if is_possible_duplicate and not st.session_state.get("confirm_duplicate_submit"):
-            st.markdown(
-                '<div class="error-box">⚠️ ดูเหมือนเพิ่งส่งข้อมูลชุดนี้ไป (สาขา/ผู้กรอก/จำนวนรูปเดียวกัน) '
-                'เมื่อไม่กี่นาทีก่อน — ถ้าตั้งใจส่งซ้ำจริง กดปุ่มด้านล่างเพื่อยืนยันอีกครั้ง</div>',
-                unsafe_allow_html=True,
-            )
-            if st.button("✅ ยืนยันว่าต้องการส่งซ้ำจริง"):
-                st.session_state.confirm_duplicate_submit = True
-                st.rerun()
-            missing = ["__pending_confirm__"]
-
         if missing:
-            if missing not in (["__debounce__"], ["__pending_confirm__"]):
+            if missing != ["__debounce__"]:
                 items = "".join([f"<br>• {m}" for m in missing])
                 st.markdown(f'<div class="error-box">⚠️ กรุณากรอกข้อมูลให้ครบก่อนอัพโหลด:{items}</div>', unsafe_allow_html=True)
         else:
             st.session_state.last_upload_click_time = now
-            st.session_state.last_submit_sig = submit_sig
-            st.session_state.last_submit_sig_time = now
-            st.session_state.confirm_duplicate_submit = False  # เคลียร์สถานะยืนยันไว้ใช้รอบหน้า
 
             safe_sender = sender_name.strip().replace("/", "-").replace("\\", "-")
             results = []
@@ -581,6 +575,7 @@ if uploaded_files:
                     receipt_data = {
                         "receipt_id": receipt_id,
                         "reporter": reporter_name.strip(),
+                        "brand": brand,
                         "branch": sender_name.strip(),
                         "zone": zone.strip(),
                         "status": status_label,
