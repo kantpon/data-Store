@@ -1,10 +1,12 @@
 import streamlit as st
 import cloudinary
+import cloudinary.api
 import cloudinary.uploader
 import io
 import datetime
 import time
 import threading
+import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 from PIL import Image, ImageOps
@@ -91,7 +93,28 @@ def load_branch_list():
 # (Streamlit รันหลาย session พร้อมกันในโปรเซสเดียว ตัวแปรนี้เลยคุมทุกคนที่ใช้แอปพร้อมกันได้จริง)
 # ถ้าคนส่งพร้อมกันเกิน 5 คน คนที่ 6 เป็นต้นไปจะ "รอคิว" สั้นๆ ก่อนได้เขียนจริง
 # แทนที่จะยิงชนกันจน Google ปฏิเสธ (429) เกือบหมดแบบที่เจอตอนทดสอบ
-SHEET_WRITE_SEMAPHORE = threading.Semaphore(5)
+# ต้องเขียนทีละรายการ เพราะหาแถวถัดไปจากคอลัมน์ G ก่อนเขียน
+# ถ้าเขียนพร้อมกันอาจเลือกแถวเดียวกันและข้อมูลทับกันได้
+SHEET_WRITE_SEMAPHORE = threading.Semaphore(1)
+SYNC_STATUS_COLUMN = 15  # คอลัมน์ O: SyncQueue
+
+def _is_retryable_error(e: Exception) -> bool:
+    """
+    แยกว่า error นี้ควร retry ไหม ตามผัง:
+    - 429 (ชนโควตา), เน็ตหลุด/timeout, 5xx (ปัญหาฝั่ง Google ชั่วคราว) -> ควร retry
+    - อย่างอื่น (สิทธิ์ผิด, ไม่พบชีท/แท็บ, ฯลฯ) -> ไม่ต้อง retry เพราะยังไงก็ไม่สำเร็จ
+    """
+    # gspread.exceptions.APIError มี .response เป็น requests.Response ให้เช็ค status code ได้
+    status_code = getattr(getattr(e, "response", None), "status_code", None)
+    if status_code is not None:
+        return status_code == 429 or 500 <= status_code < 600
+
+    # ปัญหาเน็ต/connection/timeout ฝั่งเรา ควร retry ได้เหมือนกัน
+    err_type = type(e).__name__
+    if err_type in ("ConnectionError", "Timeout", "ConnectTimeout", "ReadTimeout"):
+        return True
+
+    return False  # ไม่รู้จัก error type นี้ -> ปลอดภัยไว้ก่อน ไม่ retry
 
 def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
     """
@@ -100,8 +123,10 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
 
     ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
     จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
-    ถ้าเขียนไม่สำเร็จ จะลองใหม่อัตโนมัติสูงสุด max_retries ครั้ง โดยเว้นช่วงเพิ่มขึ้นเรื่อยๆ
-    ก่อนจะยอมแพ้และคืนค่า False พร้อม error message ล่าสุด
+
+    ถ้าเขียนไม่สำเร็จ จะดูก่อนว่า error ประเภทไหน:
+    - 429 / เน็ตหลุด / 5xx -> retry อัตโนมัติ (สูงสุด max_retries ครั้ง, รอเพิ่มขึ้นเรื่อยๆ)
+    - error อื่น (เช่น สิทธิ์ผิด, ไม่พบชีท) -> fail ทันที ไม่เสียเวลา retry เพราะยังไงก็ไม่สำเร็จ
 
     คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
     """
@@ -115,19 +140,62 @@ def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="",
 
                 # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
                 # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
-                if filename:
-                    existing_filenames = worksheet.col_values(7)  # คอลัมน์ G = ชื่อไฟล์
-                    if filename in existing_filenames:
-                        return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
+                # ห้ามใช้ append_row(): เมื่อชีตมีสูตร/ข้อมูลด้านขวา Google อาจ
+                # เลือกจุดเริ่มตารางผิดและไปเพิ่มข้อมูลที่คอลัมน์ P เป็นต้นไป
+                # ระบุตำแหน่ง A:H เองจากแถวสุดท้ายของชื่อไฟล์ในคอลัมน์ G เสมอ
+                existing_filenames = worksheet.col_values(7)
+                if filename and filename in existing_filenames:
+                    return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
 
-                worksheet.append_row([ts, reporter, branch, zone, status, reason, filename, url])
+                next_row = len(existing_filenames) + 1
+                worksheet.update(
+                    f"A{next_row}:H{next_row}",
+                    [[ts, reporter, branch, zone, status, reason, filename, url]],
+                    value_input_option="USER_ENTERED",
+                )
                 return True, ""
             except Exception as e:
                 last_err = str(e)
+
+                if not _is_retryable_error(e):
+                    return False, f"Error ที่ retry ไปก็ไม่มีทางสำเร็จ: {last_err}"
+
                 if attempt < max_retries:
                     time.sleep(min(2 ** attempt, 30))  # รอ 2s, 4s, 8s, 16s, 30s ก่อนลองใหม่
 
     return False, f"พยายามบันทึก {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
+
+
+def _find_receipt_row(worksheet, filename):
+    """หาแถวจากชื่อไฟล์ในคอลัมน์ G; ชื่อไฟล์มี UUID จึงไม่ซ้ำกัน."""
+    cells = worksheet.findall(filename, in_column=7)
+    if not cells:
+        raise LookupError(f"หาแถวของไฟล์ {filename} ไม่พบ")
+    return cells[-1].row
+
+
+def update_receipt_sync(filename, url=None, sync_status=None, max_retries=5):
+    """อัปเดตลิงก์รูป (H) และ/หรือ SyncQueue (O) โดยไม่แตะคอลัมน์สูตร I-L."""
+    last_err = ""
+
+    with SHEET_WRITE_SEMAPHORE:
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
+                row = _find_receipt_row(worksheet, filename)
+                if url is not None:
+                    worksheet.update_cell(row, 8, url)
+                if sync_status is not None:
+                    worksheet.update_cell(row, SYNC_STATUS_COLUMN, sync_status)
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                if not _is_retryable_error(e):
+                    return False, last_err
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 30))
+
+    return False, f"อัปเดตข้อมูลซิงก์ไม่สำเร็จ: {last_err}"
 
 def fix_orientation(file, thumb_side: int = 500, extra_rotation: int = 0):
     """เปิดรูป หมุนตาม EXIF ให้ถูกทาง + หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
@@ -157,7 +225,7 @@ def compress_image(file, max_side: int = 1280, quality: int = 78, extra_rotation
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue(), img.width, img.height
 
-def upload_to_cloudinary(image_bytes, filename):
+def upload_to_cloudinary(image_bytes, filename, receipt_data):
     """
     อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
     """
@@ -167,10 +235,67 @@ def upload_to_cloudinary(image_bytes, filename):
         public_id=filename,
         resource_type="image",
         overwrite=False,
+        tags=["receipt_sync_pending"],
+        context=receipt_data,
     )
-    return result.get("secure_url", "")
+    if not result.get("secure_url") or not result.get("public_id"):
+        raise RuntimeError("Cloudinary อัปโหลดสำเร็จแต่ไม่ได้คืนลิงก์รูป")
+    return result
 
 
+def sync_receipt_from_cloudinary(public_id, asset=None):
+    """เขียนรูปที่ติดแท็ก pending กลับเข้า Sheet แล้วปิดงานเมื่อครบทั้งสองฝั่ง."""
+    asset = asset or cloudinary.api.resource(public_id, resource_type="image", context=True)
+    data = asset.get("context", {}).get("custom", {})
+    if not data:
+        # upload response อาจไม่คืน context จึงอ่านข้อมูลจริงจาก Admin API อีกครั้ง
+        asset = cloudinary.api.resource(public_id, resource_type="image", context=True)
+        data = asset.get("context", {}).get("custom", {})
+    required = ("reporter", "branch", "zone", "status", "reason", "filename")
+    missing = [key for key in required if key not in data]
+    if missing:
+        return False, f"รูปไม่มีข้อมูลสำรอง: {', '.join(missing)}"
+
+    sheet_ok, sheet_err = log_to_sheet(
+        reporter=data["reporter"], branch=data["branch"], zone=data["zone"],
+        status=data["status"], reason=data["reason"],
+        filename=data["filename"], url="",
+    )
+    if not sheet_ok:
+        return False, sheet_err
+
+    pending_ok, pending_err = update_receipt_sync(data["filename"], sync_status="PENDING")
+    if not pending_ok:
+        return False, pending_err
+
+    done_ok, done_err = update_receipt_sync(
+        data["filename"], url=asset.get("secure_url", ""), sync_status="DONE"
+    )
+    if not done_ok:
+        return False, done_err
+
+    cloudinary.uploader.remove_tag("receipt_sync_pending", [public_id], resource_type="image")
+    return True, ""
+
+
+def sync_pending_receipts():
+    """ลอง sync รายการค้างเป็นระยะ โดยไม่กระทบหน้าจอผู้ใช้."""
+    now = datetime.datetime.now()
+    last_run = st.session_state.get("last_pending_sync_at")
+    if last_run and (now - last_run).total_seconds() < 300:
+        return
+    st.session_state.last_pending_sync_at = now
+
+    try:
+        response = cloudinary.api.resources_by_tag(
+            "receipt_sync_pending", resource_type="image", context=True, max_results=25
+        )
+        for asset in response.get("resources", []):
+            ok, err = sync_receipt_from_cloudinary(asset["public_id"], asset)
+            if not ok:
+                print(f"PENDING RECEIPT SYNC FAILED: {asset['public_id']} -> {err}")
+    except Exception as e:
+        print(f"PENDING RECEIPT SCAN FAILED: {e}")
 def delete_from_cloudinary(public_id):
     """
     ลบรูปออกจาก Cloudinary (ใช้ตอน rollback เมื่อบันทึกชีทไม่สำเร็จ
@@ -195,6 +320,8 @@ if "show_sent_dialog" not in st.session_state:
 if "sent_count" not in st.session_state:
     st.session_state.sent_count = 0
 
+sync_pending_receipts()
+
 @st.dialog("✅ ส่งข้อมูลสำเร็จ")
 def show_success_dialog():
     st.markdown("### คุณส่งแล้ว")
@@ -207,9 +334,6 @@ st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
-mode = st.radio("โหมด", [ "2 ใบเสร็จ"], label_visibility="collapsed")
-num_receipts = int(mode[0])
 
 # ── ชื่อผู้กรอก (พิมพ์เอง) ──
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -339,7 +463,9 @@ if uploaded_files:
         '<br><br>'
         '1. ภาพชัดให้อ่านค่าได้<br>'
         '2. มีระยะห่างจากกันระหว่างบิล<br>'
-        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br><br>'
+        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br>'
+        '<br>'
+        '⏳ <strong>โปรดรอจนกว่าจะขึ้น “ส่งข้อมูลสำเร็จ” ก่อนปิดหน้าเว็บ</strong><br><br>'
 
         '</div>',
         unsafe_allow_html=True,
@@ -415,22 +541,32 @@ if uploaded_files:
                     extra_rot = st.session_state.get("rotations", {}).get(rot_key, 0)
                     img_bytes, new_w, new_h = compress_image(f, max_side=1280, quality=78, extra_rotation=extra_rot)
 
-                    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fname = f"{safe_sender}_{ts_file}_{idx+1}"
-                    secure_url = upload_to_cloudinary(img_bytes, fname)
-
                     status_label = "ครบ" if completeness == "ครบ" else "ไม่ครบ"
-                    log_ok, log_err = log_to_sheet(
-                        reporter=reporter_name.strip(),
-                        branch=sender_name.strip(),
-                        zone=zone.strip(),
-                        status=status_label,
-                        reason=incomplete_reason.strip(),
-                        filename=f"{fname}.jpg",
-                        url=secure_url,
-                    )
+                    # เวลาอย่างเดียว (ความละเอียดเป็นวินาที) ชนกันได้เมื่อมีผู้ใช้งานพร้อมกัน
+                    # จึงใส่ UUID ลงในชื่อไฟล์และใช้ชื่อเดียวกันตลอดทั้ง Cloudinary/Sheet
+                    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    receipt_id = uuid.uuid4().hex
+                    fname = f"{safe_sender}_{ts_file}_{idx+1}_{receipt_id[:12]}"
+                    sheet_filename = f"{fname}.jpg"
 
-                    if log_ok:
+                    # อัปโหลดรูปพร้อมข้อมูลสำรองก่อน เพื่อรักษารูปไว้แม้ Sheet ขัดข้อง
+                    receipt_data = {
+                        "receipt_id": receipt_id,
+                        "reporter": reporter_name.strip(),
+                        "branch": sender_name.strip(),
+                        "zone": zone.strip(),
+                        "status": status_label,
+                        "reason": incomplete_reason.strip() or "-",
+                        "filename": sheet_filename,
+                    }
+                    upload_result = upload_to_cloudinary(img_bytes, fname, receipt_data)
+
+                    # พยายาม sync ทันที; ถ้าไม่ผ่าน รูปจะคงแท็ก receipt_sync_pending
+                    # และจะถูกลอง sync ใหม่เมื่อมีคนเปิดแอปครั้งถัดไป
+                    sync_ok, sync_err = sync_receipt_from_cloudinary(
+                        upload_result["public_id"], upload_result
+                    )
+                    if sync_ok:
                         results.append({
                             "filename": fname,
                             "ok": True,
@@ -438,12 +574,13 @@ if uploaded_files:
                             "dim": f"{new_w}×{new_h}",
                         })
                     else:
-                        # บันทึกชีทไม่ผ่าน -> ลบรูปออกจาก Cloudinary กันไม่ให้เหลือรูปกำพร้า
-                        delete_from_cloudinary(f"branch/{fname}")
+                        print(
+                            f"PENDING RECEIPT: {upload_result['public_id']} -> {sync_err}"
+                        )
                         results.append({
                             "filename": fname,
                             "ok": False,
-                            "detail": f"บันทึกลง Google Sheet ไม่สำเร็จ: {log_err}",
+                            "detail": f"เก็บรูปแล้ว แต่ sync Google Sheet ยังไม่สำเร็จ: {sync_err}",
                         })
                 except Exception as e:
                     results.append({"filename": f.name, "ok": False, "detail": str(e)})
@@ -468,7 +605,7 @@ if uploaded_files:
 
                 st.markdown(
                     f'<div class="error-box"><strong>❌ ไม่สำเร็จ {len(fail)} รูป โปรดลองอัพโหลดใหม่อีกครั้ง</strong>'
-                    f'<br>(รูปที่อัพโหลดแล้วแต่บันทึกชีทไม่ผ่าน ถูกลบออกจาก Cloudinary ให้อัตโนมัติแล้ว ไม่ต้องกังวลเรื่องรูปค้าง)</div>',
+                    f'<br>(หาก Google Sheet ขัดข้องหลังอัปโหลด รูปจะถูกเก็บไว้และระบบจะลอง sync ใหม่อัตโนมัติ)</div>',
                     unsafe_allow_html=True,
                 )
 
