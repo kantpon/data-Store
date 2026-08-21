@@ -334,6 +334,11 @@ st.markdown("# 🧾 อัพโหลดใบเสร็จ")
 st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
+# ── จำนวนใบเสร็จในรูป ──
+st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
+mode = st.radio("โหมด", ["2 ใบเสร็จ"], label_visibility="collapsed")
+num_receipts = int(mode[0])
+
 
 # ── ชื่อผู้กรอก (พิมพ์เอง) ──
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
@@ -618,4 +623,4 @@ if st.session_state.show_sent_dialog:
     show_success_dialog()
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;color:#d1d5db;font-size:0.8rem;">รูปทั้งหมดจะถูกส่งเข้าบัญชี Cloudinary ของเจ้าของระบบเท่านั้น</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#d1d5db;font-size:0.8rem;">รูปทั้งหมดจะถูกส่งเข้าบัญชี Cloudinary ของเจ้าของระบบเท่านั้น</p>', unsafe_allow_html=True
