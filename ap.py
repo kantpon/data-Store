@@ -60,8 +60,12 @@ def setup_gsheet():
     worksheet = sheet.worksheet(st.secrets["gsheet"].get("worksheet_name", "Data_Receipts"))
     return worksheet
 
-@st.cache_data(ttl=300)
-def load_branch_list():
+_BRANCH_CACHE = []
+_BRANCH_CACHE_TIME = 0.0
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_branch_list():
     """
     โหลดรายชื่อสาขาจากชีท "รายชื่อสาขา" ผ่าน Service Account
     คอลัมน์ในชีท: A=รหัส, B=รายชื่อสาขา, C=zone
@@ -87,6 +91,27 @@ def load_branch_list():
                 branches.append({"code": code, "name": name, "zone": zone})
         return branches, ""
     except Exception as e:
+        return [], str(e)
+
+
+def load_branch_list():
+    """คืนรายชื่อสาขาจาก cache และใช้รายการเดิมต่อชั่วคราวเมื่อ Google ตอบ 429."""
+    global _BRANCH_CACHE, _BRANCH_CACHE_TIME
+
+    try:
+        branches, err = _fetch_branch_list()
+        if branches:
+            _BRANCH_CACHE = branches
+            _BRANCH_CACHE_TIME = time.time()
+            return branches, ""
+
+        # ถ้า Google ตอบ quota/429 ให้ใช้ข้อมูลล่าสุดต่อไปก่อน
+        if _BRANCH_CACHE and ("429" in err or "Quota exceeded" in err):
+            return _BRANCH_CACHE, ""
+        return branches, err
+    except Exception as e:
+        if _BRANCH_CACHE:
+            return _BRANCH_CACHE, ""
         return [], str(e)
 
 # จำกัดจำนวนคนที่เขียนชีทพร้อมกันจริงๆ ในเซิร์ฟเวอร์เดียวกัน ไม่ให้ยิงชนกันหมดทีเดียว
