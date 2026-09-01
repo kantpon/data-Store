@@ -174,64 +174,6 @@ def _is_retryable_error(e: Exception) -> bool:
 
     return False  # ไม่รู้จัก error type นี้ -> ปลอดภัยไว้ก่อน ไม่ retry
 
-def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
-    """
-    บันทึกแถวข้อมูลลง Google Sheet ผ่าน Service Account (gspread)
-    ลำดับคอลัมน์: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
-
-    ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
-    จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
-
-    ถ้าเขียนไม่สำเร็จ จะดูก่อนว่า error ประเภทไหน:
-    - 429 / เน็ตหลุด / 5xx -> retry อัตโนมัติ (สูงสุด max_retries ครั้ง, รอเพิ่มขึ้นเรื่อยๆ)
-    - error อื่น (เช่น สิทธิ์ผิด, ไม่พบชีท) -> fail ทันที ไม่เสียเวลา retry เพราะยังไงก็ไม่สำเร็จ
-
-    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
-    """
-    ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    last_err = ""
-
-    with SHEET_WRITE_SEMAPHORE:  # รอคิวถ้ามีคนอื่นกำลังเขียนอยู่เกิน 5 คนพร้อมกัน
-        for attempt in range(1, max_retries + 1):
-            try:
-                worksheet = setup_gsheet()
-
-                # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
-                # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
-                # ห้ามใช้ append_row(): เมื่อชีตมีสูตร/ข้อมูลด้านขวา Google อาจ
-                # เลือกจุดเริ่มตารางผิดและไปเพิ่มข้อมูลที่คอลัมน์ P เป็นต้นไป
-                # ระบุตำแหน่ง A:H เองจากแถวสุดท้ายของชื่อไฟล์ในคอลัมน์ G เสมอ
-                existing_filenames = worksheet.col_values(7)
-                if filename and filename in existing_filenames:
-                    return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
-
-                next_row = len(existing_filenames) + 1
-
-                # Google Sheets บางไฟล์ตั้งจำนวนแถวเริ่มต้นไว้เพียง 100/120 แถว
-                # ถ้าแถวถัดไปเกินขนาดชีต update จะล้มเหลวด้วย 400 grid limits
-                # จึงขยายจำนวนแถวก่อนเขียน (ไม่กระทบสูตร/คอลัมน์ด้านขวา)
-                current_rows = int(getattr(worksheet, "row_count", 0) or 0)
-                if next_row > current_rows:
-                    worksheet.add_rows(max(100, next_row - current_rows))
-
-                worksheet.update(
-                    range_name=f"A{next_row}:H{next_row}",
-                    values=[[ts, reporter, branch, zone, status, reason, filename, url]],
-                    value_input_option="USER_ENTERED",
-                )
-                return True, ""
-            except Exception as e:
-                last_err = str(e)
-
-                if not _is_retryable_error(e):
-                    return False, f"Error ที่ retry ไปก็ไม่มีทางสำเร็จ: {last_err}"
-
-                if attempt < max_retries:
-                    time.sleep(min(2 ** attempt, 30))  # รอ 2s, 4s, 8s, 16s, 30s ก่อนลองใหม่
-
-    return False, f"พยายามบันทึก {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
-
-
 def log_batch_to_sheet(records, max_retries=3):
     """เขียนและตรวจหลายแถวแบบ idempotent โดยใช้ API ให้น้อยที่สุด."""
     if not records:
@@ -566,9 +508,7 @@ def sync_pending_receipts():
     ).start()
 
 
-def delete_from_cloudinary(public_id):  # retained only for backward compatibility; never used
-    """ไม่ใช้ rollback อัตโนมัติ: รูปต้องคงอยู่เพื่อรอ Sync ไป Google Sheet."""
-    return False
+ 
 
 setup_cloudinary()
 
@@ -616,9 +556,7 @@ if branch_err:
     print(f"BRANCH LIST LOAD FAILED: {branch_err}")
     st.markdown(
         '<div class="error-box">❌ โหลดรายชื่อสาขาไม่สำเร็จ<br>'
-        'กรุณาลองใหม่อีกครั้ง หากยังไม่สำเร็จให้แจ้งผู้ดูแลระบบ<br>'
-        f'ตรวจสอบว่ามี worksheet ชื่อ "รายชื่อสาขา" (หรือชื่อที่ตั้งใน secrets) '
-        f'และมีคอลัมน์หัวตาราง รหัส, รายชื่อสาขา, zone</div>',
+        'กรุณาลองใหม่อีกครั้ง หากยังไม่สำเร็จให้แจ้งผู้ดูแลระบบ</div>',
         unsafe_allow_html=True,
     )
     sender_name, zone = "", ""
