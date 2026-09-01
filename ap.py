@@ -566,22 +566,9 @@ def sync_pending_receipts():
     ).start()
 
 
-def delete_from_cloudinary(public_id):
-    """
-    ลบรูปออกจาก Cloudinary (ใช้ตอน rollback เมื่อบันทึกชีทไม่สำเร็จ
-    เพื่อไม่ให้เหลือ "รูปกำพร้า" ที่มีในคลาวแต่ไม่มีในชีท)
-    คืน True ถ้าลบสำเร็จ, False ถ้าลบไม่สำเร็จ (พร้อม print เหตุผลไว้ให้เช็คได้)
-    """
-    try:
-        result = cloudinary.uploader.destroy(public_id, resource_type="image", invalidate=True)
-        # Cloudinary จะตอบ {"result": "ok"} ถ้าลบสำเร็จจริง, "not found" ถ้าไม่เจอไฟล์
-        if result.get("result") != "ok":
-            print(f"CLOUDINARY DELETE FAILED: {public_id} -> {result}")
-            return False
-        return True
-    except Exception as e:
-        print(f"CLOUDINARY DELETE ERROR: {public_id} -> {e}")
-        return False
+def delete_from_cloudinary(public_id):  # retained only for backward compatibility; never used
+    """ไม่ใช้ rollback อัตโนมัติ: รูปต้องคงอยู่เพื่อรอ Sync ไป Google Sheet."""
+    return False
 
 setup_cloudinary()
 
@@ -606,8 +593,7 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 # ── จำนวนใบเสร็จในรูป ──
 st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
-mode = st.radio("โหมด", ["2 ใบเสร็จ"], label_visibility="collapsed")
-num_receipts = int(mode[0])
+st.radio("โหมด", ["2 ใบเสร็จ"], label_visibility="collapsed")
 
 
 # ── ชื่อผู้กรอก (พิมพ์เอง) ──
@@ -626,8 +612,11 @@ st.markdown("#### 🏢 เลือกสาขา")
 branches, branch_err = load_branch_list()
 
 if branch_err:
+    # ไม่แสดงข้อความ exception ดิบในหน้าเว็บ เพราะอาจมี HTML/รายละเอียดภายในระบบปนมา
+    print(f"BRANCH LIST LOAD FAILED: {branch_err}")
     st.markdown(
-        f'<div class="error-box">❌ โหลดรายชื่อสาขาไม่สำเร็จ: {branch_err}<br>'
+        '<div class="error-box">❌ โหลดรายชื่อสาขาไม่สำเร็จ<br>'
+        'กรุณาลองใหม่อีกครั้ง หากยังไม่สำเร็จให้แจ้งผู้ดูแลระบบ<br>'
         f'ตรวจสอบว่ามี worksheet ชื่อ "รายชื่อสาขา" (หรือชื่อที่ตั้งใน secrets) '
         f'และมีคอลัมน์หัวตาราง รหัส, รายชื่อสาขา, zone</div>',
         unsafe_allow_html=True,
