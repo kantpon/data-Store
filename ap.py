@@ -1,434 +1,924 @@
-"""Offline tests for the current Google Sheet batch writer in app.py.
-
-No Google Sheet or Cloudinary data is touched. The production implementations
-of ``_http_status_code``, ``_is_retryable_error`` and ``log_batch_to_sheet`` are
-extracted from app.py's AST and run against a thread-safe in-memory worksheet.
-"""
-
-from __future__ import annotations
-
-import ast
-import re
+import streamlit as st
+import cloudinary
+import cloudinary.api
+import cloudinary.uploader
+import io
+import datetime
+import time
 import threading
-import time as real_time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from types import SimpleNamespace
+import uuid
+import gspread
+from google.oauth2.service_account import Credentials
+from PIL import Image, ImageOps
+
+st.set_page_config(page_title="อัพโหลดใบเสร็จ", page_icon="🧾", layout="centered")
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Sarabun', sans-serif; }
+    .stApp { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+    .block-container { background: white; border-radius: 20px; padding: 2.5rem 2rem !important; margin-top: 2rem; box-shadow: 0 20px 60px rgba(0,0,0,0.15); max-width: 680px; }
+    h1 { color: #1a1a2e !important; font-weight: 700 !important; text-align: center; }
+    .subtitle { text-align: center; color: #6b7280; margin-top: -0.5rem; margin-bottom: 1.5rem; font-size: 1rem; }
+    .stButton > button { background: linear-gradient(135deg, #667eea, #764ba2) !important; color: white !important; border: none !important; border-radius: 12px !important; padding: 0.75rem 2rem !important; font-size: 1.1rem !important; font-weight: 600 !important; width: 100%; }
+    .success-box { background: #f0fdf4; border: 2px solid #86efac; border-radius: 14px; padding: 1.2rem 1.5rem; color: #166534; margin-top: 1rem; }
+    .error-box { background: #fef2f2; border: 2px solid #fca5a5; border-radius: 14px; padding: 1.2rem 1.5rem; color: #991b1b; margin-top: 1rem; }
+    .branch-box { background: #eef2ff; border: 2px solid #c7d2fe; border-radius: 14px; padding: 1rem 1.2rem; color: #3730a3; margin-top: 0.6rem; }
+    .guide-box { background: #fffbeb; border: 2px solid #fcd34d; border-radius: 14px; padding: 1.2rem 1.4rem; color: #92400e; margin: 1rem 0; line-height: 1.7; }
+    .divider { border: none; border-top: 1.5px solid #f3f4f6; margin: 1.5rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+@st.cache_resource
+def setup_cloudinary():
+    cloudinary.config(
+        cloud_name=st.secrets["cloudinary"]["cloud_name"],
+        api_key=st.secrets["cloudinary"]["api_key"],
+        api_secret=st.secrets["cloudinary"]["api_secret"],
+        secure=True
+    )
+
+@st.cache_resource
+def get_gsheet_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def _get_result_worksheet(sheet_url, worksheet_name):
+    """
+    เชื่อมต่อ Google Sheet (ชีทบันทึกผลลัพธ์) ผ่าน Service Account
+    ต้องมี st.secrets["gcp_service_account"] และ st.secrets["gsheet"]["sheet_url"]
+    """
+    client = get_gsheet_client()
+    sheet = client.open_by_url(sheet_url)
+    worksheet = sheet.worksheet(worksheet_name)
+    print(f"GSHEET WRITE TARGET: spreadsheet_id={sheet.id}, worksheet={worksheet.title}")
+    return worksheet
 
 
-APP_PATH = Path(__file__).with_name("app.py")
+def setup_gsheet():
+    """ใช้ URL/ชื่อแท็บเป็น cache key จึงไม่ค้างไฟล์เก่าเมื่อแก้ Streamlit Secrets."""
+    sheet_url = st.secrets["gsheet"]["sheet_url"]
+    worksheet_name = st.secrets["gsheet"].get("worksheet_name", "Data_Receipts")
+    return _get_result_worksheet(sheet_url, worksheet_name)
+
+@st.cache_resource
+def get_branch_fallback_state():
+    return {"branches": [], "updated_at": 0.0}
 
 
-class FastTime:
-    """Keep retries fast while preserving production cooldown calculations."""
-
-    @staticmethod
-    def sleep(_seconds):
-        return None
-
-    @staticmethod
-    def monotonic():
-        return real_time.monotonic()
+_BRANCH_FALLBACK = get_branch_fallback_state()
 
 
-class FakeAPIError(Exception):
-    def __init__(self, status_code: int, message: str):
-        super().__init__(message)
-        self.response = SimpleNamespace(status_code=status_code)
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_branch_list(sheet_url, ws_name):
+    """
+    โหลดรายชื่อสาขาจากชีท "รายชื่อสาขา" ผ่าน Service Account
+    คอลัมน์ในชีท: A=รหัส, B=รายชื่อสาขา, C=zone
+    ตั้งชื่อ worksheet ผ่าน st.secrets["gsheet"]["branch_worksheet_name"] (ค่าเริ่มต้น "รายชื่อสาขา")
+    ตั้ง URL ชีทแยกได้ผ่าน st.secrets["gsheet"]["branch_sheet_url"] (ถ้าไม่ตั้ง จะใช้ sheet_url เดิม)
+    คืนค่า list ของ dict: [{"code":..., "name":..., "zone":...}, ...]
+    """
+    client = get_gsheet_client()
+    sheet = client.open_by_url(sheet_url)
+    worksheet = sheet.worksheet(ws_name)
+    # ระบุหัวตารางที่คาดหวังไว้ตรงๆ กันปัญหา "หัวตารางว่างซ้ำกัน"
+    records = worksheet.get_all_records(expected_headers=["รหัส", "รายชื่อสาขา", "zone"])
+
+    branches = []
+    for r in records:
+        code = str(r.get("รหัส", "")).strip()
+        name = str(r.get("รายชื่อสาขา", "")).strip()
+        zone = str(r.get("zone", "")).strip()
+        if name:
+            branches.append({"code": code, "name": name, "zone": zone})
+    return branches, ""
 
 
-def _column_index(column_letters: str) -> int:
-    result = 0
-    for character in column_letters:
-        result = (result * 26) + ord(character) - ord("A") + 1
-    return result - 1
-
-
-class MemoryWorksheet:
-    """Thread-safe gspread Worksheet stand-in with request fault injection."""
-
-    def __init__(
-        self,
-        row_count=120,
-        fail_read_at=None,
-        fail_write_at=None,
-        fail_read_from=None,
-        fail_write_from=None,
-    ):
-        self.row_count = row_count
-        self.rows = [[
-            "วันที่เวลา", "ผู้กรอก", "สาขา", "Zone", "สถานะ", "เหตุผล",
-            "ชื่อไฟล์", "ลิงก์รูป", "", "", "", "", "", "", "SyncQueue",
-        ]]
-        self.reads = 0
-        self.writes = 0
-        self.add_rows_calls = 0
-        self.batch_get_calls = 0
-        self.batch_update_calls = 0
-        self.fail_read_at = set(fail_read_at or [])
-        self.fail_write_at = set(fail_write_at or [])
-        self.fail_read_from = fail_read_from
-        self.fail_write_from = fail_write_from
-        self._lock = threading.RLock()
-
-    def _read_request(self):
-        self.reads += 1
-        if self.reads in self.fail_read_at or (
-            self.fail_read_from is not None and self.reads >= self.fail_read_from
-        ):
-            raise FakeAPIError(429, "Quota exceeded: mock read quota")
-
-    def _write_request(self):
-        self.writes += 1
-        if self.writes in self.fail_write_at or (
-            self.fail_write_from is not None and self.writes >= self.fail_write_from
-        ):
-            raise FakeAPIError(429, "Quota exceeded: mock write quota")
-
-    def _ensure_rows(self, count):
-        while len(self.rows) < count:
-            self.rows.append([""] * 15)
-
-    @staticmethod
-    def _trim_row(row):
-        trimmed = list(row)
-        while trimmed and trimmed[-1] == "":
-            trimmed.pop()
-        return trimmed
-
-    @staticmethod
-    def _parse_write_range(range_name):
-        match = re.fullmatch(r"([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?", range_name)
-        if not match:
-            raise AssertionError(f"Unsupported mock write range: {range_name}")
-        start_col, start_row, end_col, end_row = match.groups()
-        return (
-            _column_index(start_col), int(start_row),
-            _column_index(end_col or start_col), int(end_row or start_row),
+def load_branch_list():
+    """คืนรายชื่อสาขาจาก cache และใช้รายการเดิมต่อชั่วคราวเมื่อ Google ตอบ 429."""
+    try:
+        sheet_url = st.secrets["gsheet"].get(
+            "branch_sheet_url", st.secrets["gsheet"]["sheet_url"]
         )
+        ws_name = st.secrets["gsheet"].get("branch_worksheet_name", "รายชื่อสาขา")
+        branches, err = _fetch_branch_list(sheet_url, ws_name)
+        if branches:
+            _BRANCH_FALLBACK["branches"] = branches
+            _BRANCH_FALLBACK["updated_at"] = time.time()
+            return branches, ""
 
-    def _read_range_without_request(self, range_name):
-        match = re.fullmatch(r"([A-Z]+):([A-Z]+)", range_name)
-        if not match:
-            raise AssertionError(f"Unsupported mock read range: {range_name}")
-        left, right = (_column_index(value) for value in match.groups())
-        last_nonempty = 0
-        for row_number, row in enumerate(self.rows, start=1):
-            if any(row[left:right + 1]):
-                last_nonempty = row_number
-        return [
-            self._trim_row(row[left:right + 1])
-            for row in self.rows[:last_nonempty]
-        ]
+        # ถ้า Google ตอบ quota/429 ให้ใช้ข้อมูลล่าสุดต่อไปก่อน
+        if _BRANCH_FALLBACK["branches"] and ("429" in err or "Quota exceeded" in err):
+            return _BRANCH_FALLBACK["branches"], ""
+        return branches, err
+    except Exception as e:
+        if _BRANCH_FALLBACK["branches"]:
+            return _BRANCH_FALLBACK["branches"], ""
+        return [], str(e)
 
-    def batch_get(self, ranges):
-        with self._lock:
-            self._read_request()
-            self.batch_get_calls += 1
-            return [self._read_range_without_request(item) for item in ranges]
-
-    def add_rows(self, count):
-        with self._lock:
-            self._write_request()
-            self.add_rows_calls += 1
-            self.row_count += int(count)
-
-    def batch_update(self, updates, value_input_option=None):
-        del value_input_option
-        with self._lock:
-            # Model a single atomic values.batchUpdate request: an injected
-            # 429 occurs before any cell is changed.
-            self._write_request()
-            self.batch_update_calls += 1
-            parsed_updates = []
-            for update in updates:
-                left, start_row, right, end_row = self._parse_write_range(update["range"])
-                values = update["values"]
-                if end_row > self.row_count:
-                    raise FakeAPIError(400, "Range exceeds grid limits")
-                assert end_row - start_row + 1 == len(values)
-                assert all(len(row) == right - left + 1 for row in values)
-                parsed_updates.append((left, start_row, right, end_row, values))
-            for left, start_row, right, end_row, values in parsed_updates:
-                self._ensure_rows(end_row)
-                for row_number, incoming in zip(range(start_row, end_row + 1), values):
-                    self.rows[row_number - 1][left:right + 1] = list(incoming)
-            return {"totalUpdatedRows": sum(len(item[4]) for item in parsed_updates)}
-
-    def seed_record(self, record, url=None, sync_status=""):
-        """Insert an existing row without consuming a mock API request."""
-        row = list(record) + [""] * 7
-        if url is not None:
-            row[7] = url
-        row[14] = sync_status
-        with self._lock:
-            self.rows.append(row[:15])
-
-    def data_rows(self):
-        with self._lock:
-            return [list(row) for row in self.rows[1:] if row[6]]
-
-
-def load_app_functions(sheet):
-    source = APP_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(APP_PATH))
-    wanted = {"_http_status_code", "_is_retryable_error", "log_batch_to_sheet"}
-    selected = [
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in wanted
-    ]
-    found = {node.name for node in selected}
-    assert found == wanted, f"Missing production functions: {sorted(wanted - found)}"
-    namespace = {
-        "threading": threading,
-        "time": FastTime,
-        "SHEET_WRITE_SEMAPHORE": threading.Semaphore(1),
-        "SHEET_COOLDOWN_STATE": {"until": 0.0},
-        "SHEET_BATCH_TIMES": [],
-        "SHEET_RATE_WINDOW_SECONDS": 60,
-        "MAX_SHEET_BATCHES_PER_MINUTE": 18,
-        "setup_gsheet": lambda: sheet,
-    }
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), str(APP_PATH), "exec"),
-        namespace,
-    )
-    return SimpleNamespace(
-        http_status_code=namespace["_http_status_code"],
-        is_retryable_error=namespace["_is_retryable_error"],
-        write_batch=namespace["log_batch_to_sheet"],
-        cooldown=namespace["SHEET_COOLDOWN_STATE"],
-        batch_times=namespace["SHEET_BATCH_TIMES"],
-        max_batches=namespace["MAX_SHEET_BATCHES_PER_MINUTE"],
-    )
-
-
-def make_records(user_number, photo_count=6):
-    return [[
-        "01/09/2026 10:00:00", f"user-{user_number}", f"branch-{user_number}",
-        "zone-test", "ครบ", "-", f"user-{user_number}-photo-{photo_number}.jpg",
-        f"https://mock.invalid/user-{user_number}-photo-{photo_number}.jpg",
-    ] for photo_number in range(1, photo_count + 1)]
-
-
-def flatten_records(batches):
-    return [record for _user_number, records in batches for record in records]
-
-
-def verify_sheet(sheet, expected_records):
-    actual_rows = sheet.data_rows()
-    actual_by_filename = {}
-    for row in actual_rows:
-        filename = row[6]
-        assert filename not in actual_by_filename, f"Duplicate row for {filename}"
-        actual_by_filename[filename] = row
-    expected_by_filename = {record[6]: record for record in expected_records}
-    assert len(expected_by_filename) == len(expected_records), "Test data has duplicate UUIDs"
-    assert set(actual_by_filename) == set(expected_by_filename), (
-        f"Missing={sorted(set(expected_by_filename) - set(actual_by_filename))}; "
-        f"unexpected={sorted(set(actual_by_filename) - set(expected_by_filename))}"
-    )
-    for filename, expected in expected_by_filename.items():
-        actual = actual_by_filename[filename]
-        assert actual[:8] == expected, f"A:H mismatch for {filename}: {actual[:8]!r}"
-        assert actual[14] == "DONE", f"O is not DONE for {filename}"
-
-
-def submit_concurrently(app, batches):
-    if not batches:
-        return []
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        futures = [
-            (user_number, records, pool.submit(app.write_batch, records))
-            for user_number, records in batches
-        ]
-    return [
-        (user_number, records, *future.result())
-        for user_number, records, future in futures
-    ]
-
-
-def stats(sheet, results):
+@st.cache_resource
+def get_coordination_state():
+    """เก็บ lock/cooldown ร่วมกันทุก Streamlit session ภายใน app process เดียว."""
     return {
-        "successes": sum(1 for _user, _records, ok, _error in results if ok),
-        "failures": sum(1 for _user, _records, ok, _error in results if not ok),
-        "sheet_rows": len(sheet.data_rows()),
-        "done_rows": sum(1 for row in sheet.data_rows() if row[14] == "DONE"),
-        "reads": sheet.reads,
-        "writes": sheet.writes,
-        "add_rows_calls": sheet.add_rows_calls,
+        "sheet_write": threading.Semaphore(1),
+        "cloudinary_upload": threading.Semaphore(3),
+        "image_process": threading.Semaphore(2),
+        "pending_sync_lock": threading.Lock(),
+        "pending_sync": {"last_run": 0.0, "running": False},
+        "sheet_cooldown": {"until": 0.0},
+        "sheet_batch_times": [],
     }
 
 
-def test_happy_concurrency(users):
-    sheet = MemoryWorksheet(row_count=120)
-    app = load_app_functions(sheet)
-    batches = [(user, make_records(user)) for user in range(1, users + 1)]
-    results = submit_concurrently(app, batches)
-    expected_first_successes = min(users, app.max_batches)
-    assert sum(1 for _user, _records, ok, _error in results if ok) == expected_first_successes
-    failed_batches = [
-        (user, records) for user, records, ok, _error in results if not ok
-    ]
-    retry_results = []
-    if failed_batches:
-        # Model the next one-minute rate window used by Pending Sync.
-        app.batch_times.clear()
-        retry_results = submit_concurrently(app, failed_batches)
-        assert all(ok for _user, _records, ok, _error in retry_results)
-    verify_sheet(sheet, flatten_records(batches))
-    result = stats(sheet, results + retry_results)
-    result["first_wave_successes"] = expected_first_successes
-    result["queued_then_recovered"] = len(failed_batches)
-    return result
+_COORDINATION = get_coordination_state()
+SHEET_WRITE_SEMAPHORE = _COORDINATION["sheet_write"]
+CLOUDINARY_UPLOAD_SEMAPHORE = _COORDINATION["cloudinary_upload"]
+IMAGE_PROCESS_SEMAPHORE = _COORDINATION["image_process"]
+PENDING_SYNC_LOCK = _COORDINATION["pending_sync_lock"]
+PENDING_SYNC_STATE = _COORDINATION["pending_sync"]
+SHEET_COOLDOWN_STATE = _COORDINATION["sheet_cooldown"]
+SHEET_BATCH_TIMES = _COORDINATION["sheet_batch_times"]
+PENDING_SYNC_INTERVAL_SECONDS = 300
+PENDING_SYNC_BATCH_SIZE = 50
+SHEET_RATE_WINDOW_SECONDS = 60
+MAX_SHEET_BATCHES_PER_MINUTE = 18
+SYNC_STATUS_COLUMN = 15  # คอลัมน์ O: SyncQueue
 
 
-def test_concurrent_429_recovery(users, *, read_at=None, write_at=None):
-    sheet = MemoryWorksheet(
-        row_count=120,
-        fail_read_at={read_at} if read_at else None,
-        fail_write_at={write_at} if write_at else None,
-    )
-    app = load_app_functions(sheet)
-    batches = [(user, make_records(user)) for user in range(1, users + 1)]
-    first_results = submit_concurrently(app, batches)
-    failed_batches = [
-        (user, records) for user, records, ok, _error in first_results if not ok
-    ]
-    assert failed_batches, "Injected 429 did not produce a reported failure"
-    assert any(
-        "429" in error or "Quota exceeded" in error
-        for _user, _records, ok, error in first_results if not ok
-    )
-    # Simulate successive quota windows. A write-side 429 can put nearly the
-    # whole first wave into Pending, so recovery may legitimately need more
-    # than one 18-batch window.
-    retry_results = []
-    pending = failed_batches
-    while pending:
-        app.cooldown["until"] = 0.0
-        app.batch_times.clear()
-        window_results = submit_concurrently(app, pending)
-        retry_results.extend(window_results)
-        next_pending = [
-            (user, records)
-            for user, records, ok, _error in window_results
-            if not ok
+def _http_status_code(e: Exception):
+    return getattr(getattr(e, "response", None), "status_code", None)
+
+def _is_retryable_error(e: Exception) -> bool:
+    """
+    แยกว่า error นี้ควร retry ไหม ตามผัง:
+    - 429 (ชนโควตา), เน็ตหลุด/timeout, 5xx (ปัญหาฝั่ง Google ชั่วคราว) -> ควร retry
+    - อย่างอื่น (สิทธิ์ผิด, ไม่พบชีท/แท็บ, ฯลฯ) -> ไม่ต้อง retry เพราะยังไงก็ไม่สำเร็จ
+    """
+    # gspread.exceptions.APIError มี .response เป็น requests.Response ให้เช็ค status code ได้
+    status_code = _http_status_code(e)
+    if status_code is not None:
+        return status_code == 429 or 500 <= status_code < 600
+
+    # ปัญหาเน็ต/connection/timeout ฝั่งเรา ควร retry ได้เหมือนกัน
+    err_type = type(e).__name__
+    if err_type in ("ConnectionError", "Timeout", "ConnectTimeout", "ReadTimeout"):
+        return True
+
+    return False  # ไม่รู้จัก error type นี้ -> ปลอดภัยไว้ก่อน ไม่ retry
+
+def log_to_sheet(reporter, branch, zone, status, reason="", filename="", url="", max_retries=5):
+    """
+    บันทึกแถวข้อมูลลง Google Sheet ผ่าน Service Account (gspread)
+    ลำดับคอลัมน์: วันที่เวลา, ผู้กรอก, สาขา, Zone, สถานะ, เหตุผล, ชื่อไฟล์, ลิงก์รูป
+
+    ก่อนเขียน จะเช็คก่อนว่า "ชื่อไฟล์" นี้เคยถูกบันทึกไว้แล้วหรือยัง (กันเขียนซ้ำจาก retry)
+    จำกัดจำนวนคนที่เขียนพร้อมกันจริงๆ ด้วย SHEET_WRITE_SEMAPHORE กันชนโควตา
+
+    ถ้าเขียนไม่สำเร็จ จะดูก่อนว่า error ประเภทไหน:
+    - 429 / เน็ตหลุด / 5xx -> retry อัตโนมัติ (สูงสุด max_retries ครั้ง, รอเพิ่มขึ้นเรื่อยๆ)
+    - error อื่น (เช่น สิทธิ์ผิด, ไม่พบชีท) -> fail ทันที ไม่เสียเวลา retry เพราะยังไงก็ไม่สำเร็จ
+
+    คืน True ถ้าสำเร็จ, False ถ้าไม่สำเร็จ (พร้อม error message)
+    """
+    ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    last_err = ""
+
+    with SHEET_WRITE_SEMAPHORE:  # รอคิวถ้ามีคนอื่นกำลังเขียนอยู่เกิน 5 คนพร้อมกัน
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
+
+                # กันเขียนซ้ำ: เช็คว่าชื่อไฟล์นี้เคยถูกบันทึกไว้แล้วหรือยัง
+                # (สำคัญเพราะมี retry — ถ้าไม่กันตรงนี้ retry จะสร้างแถวซ้ำได้)
+                # ห้ามใช้ append_row(): เมื่อชีตมีสูตร/ข้อมูลด้านขวา Google อาจ
+                # เลือกจุดเริ่มตารางผิดและไปเพิ่มข้อมูลที่คอลัมน์ P เป็นต้นไป
+                # ระบุตำแหน่ง A:H เองจากแถวสุดท้ายของชื่อไฟล์ในคอลัมน์ G เสมอ
+                existing_filenames = worksheet.col_values(7)
+                if filename and filename in existing_filenames:
+                    return True, ""  # มีแถวนี้อยู่แล้ว ถือว่าสำเร็จ ไม่ต้องเขียนซ้ำ
+
+                next_row = len(existing_filenames) + 1
+
+                # Google Sheets บางไฟล์ตั้งจำนวนแถวเริ่มต้นไว้เพียง 100/120 แถว
+                # ถ้าแถวถัดไปเกินขนาดชีต update จะล้มเหลวด้วย 400 grid limits
+                # จึงขยายจำนวนแถวก่อนเขียน (ไม่กระทบสูตร/คอลัมน์ด้านขวา)
+                current_rows = int(getattr(worksheet, "row_count", 0) or 0)
+                if next_row > current_rows:
+                    worksheet.add_rows(max(100, next_row - current_rows))
+
+                worksheet.update(
+                    range_name=f"A{next_row}:H{next_row}",
+                    values=[[ts, reporter, branch, zone, status, reason, filename, url]],
+                    value_input_option="USER_ENTERED",
+                )
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+
+                if not _is_retryable_error(e):
+                    return False, f"Error ที่ retry ไปก็ไม่มีทางสำเร็จ: {last_err}"
+
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 30))  # รอ 2s, 4s, 8s, 16s, 30s ก่อนลองใหม่
+
+    return False, f"พยายามบันทึก {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
+
+
+def log_batch_to_sheet(records, max_retries=3):
+    """เขียนและตรวจหลายแถวแบบ idempotent โดยใช้ API ให้น้อยที่สุด."""
+    if not records:
+        return True, ""
+
+    # เมื่อ Google เพิ่งตอบ 429 ให้พักทั้งแอปก่อน ไม่ยิง retry ซ้ำจากทุก session
+    remaining = SHEET_COOLDOWN_STATE["until"] - time.monotonic()
+    if remaining > 0:
+        return False, f"APIError: [429] Google Sheet อยู่ในช่วงพักโควตาอีก {int(remaining) + 1} วินาที"
+
+    last_err = ""
+    with SHEET_WRITE_SEMAPHORE:
+        remaining = SHEET_COOLDOWN_STATE["until"] - time.monotonic()
+        if remaining > 0:
+            return False, f"APIError: [429] Google Sheet อยู่ในช่วงพักโควตาอีก {int(remaining) + 1} วินาที"
+
+        # จำกัดจำนวน Batch ภายในแอปให้เหลือพื้นที่สำหรับโหลดสาขาและงานซ่อม Pending
+        now = time.monotonic()
+        SHEET_BATCH_TIMES[:] = [
+            started for started in SHEET_BATCH_TIMES
+            if now - started < SHEET_RATE_WINDOW_SECONDS
         ]
-        assert len(next_pending) < len(pending), "Pending recovery made no progress"
-        pending = next_pending
-    verify_sheet(sheet, flatten_records(batches))
-    combined = first_results + retry_results
-    result = stats(sheet, combined)
-    result["first_wave_failures"] = len(failed_batches)
-    result["retry_successes"] = sum(
-        1 for _user, _records, ok, _error in retry_results if ok
-    )
-    return result
+        if len(SHEET_BATCH_TIMES) >= MAX_SHEET_BATCHES_PER_MINUTE:
+            return False, "คิว Google Sheet เต็มชั่วคราว ระบบจะเก็บรูปไว้รอ Sync"
+        SHEET_BATCH_TIMES.append(now)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
+
+                # อ่าน A:H และ O พร้อมกันใน API call เดียว เพื่อใช้หาแถวและกันข้อมูลซ้ำ
+                current_main, current_sync = worksheet.batch_get(["A:H", "O:O"])
+                main_rows = list(current_main)
+                sync_rows = list(current_sync)
+                existing = {}
+                for row_number, row in enumerate(main_rows, start=1):
+                    if len(row) > 6 and str(row[6]).strip():
+                        existing[str(row[6]).strip()] = {
+                            "row": row_number,
+                            "data": [str(v).strip() for v in row],
+                            "sync": (
+                                str(sync_rows[row_number - 1][0]).strip()
+                                if row_number <= len(sync_rows) and sync_rows[row_number - 1]
+                                else ""
+                            ),
+                        }
+
+                new_records = []
+                repairs = []
+                for record in records:
+                    filename = str(record[6]).strip()
+                    expected_url = str(record[7]).strip()
+                    found = existing.get(filename)
+                    if not found:
+                        new_records.append(record)
+                        continue
+
+                    # UUID เดิมต้องตรงกับข้อมูล B:G เดิม หากไม่ตรงจะไม่แสดงว่าสำเร็จ
+                    old = found["data"] + [""] * (8 - len(found["data"]))
+                    expected = [str(v).strip() for v in record]
+                    if old[1:7] != expected[1:7]:
+                        raise RuntimeError(f"ข้อมูลเดิมใน Sheet ไม่ตรงกับไฟล์ {filename}")
+                    if not old[0]:
+                        repairs.append({"range": f"A{found['row']}", "values": [[expected[0]]]})
+                    if old[7] not in ("", expected_url):
+                        raise RuntimeError(f"ลิงก์เดิมใน Sheet ไม่ตรงกับไฟล์ {filename}")
+                    if old[7] != expected_url:
+                        repairs.append({"range": f"H{found['row']}", "values": [[expected_url]]})
+                    if found["sync"] != "DONE":
+                        repairs.append({"range": f"O{found['row']}", "values": [["DONE"]]})
+
+                updates = list(repairs)
+                if new_records:
+                    start_row = len(main_rows) + 1
+                    end_row = start_row + len(new_records) - 1
+                    current_rows = int(getattr(worksheet, "row_count", 0) or 0)
+                    if end_row > current_rows:
+                        worksheet.add_rows(max(100, end_row - current_rows))
+                    updates.extend([
+                        {"range": f"A{start_row}:H{end_row}", "values": new_records},
+                        {"range": f"O{start_row}:O{end_row}", "values": [["DONE"] for _ in new_records]},
+                    ])
+
+                # A:H, O และรายการซ่อมทั้งหมดถูกรวมเป็น write request เดียว
+                if updates:
+                    worksheet.batch_update(
+                        updates,
+                        value_input_option="USER_ENTERED",
+                    )
+
+                # ตรวจกลับ B:H และ O ของทุกไฟล์ ก่อนอนุญาตให้ขึ้น "ส่งข้อมูลสำเร็จ"
+                verified_main, verified_sync = worksheet.batch_get(["A:H", "O:O"])
+                verified_sync_rows = list(verified_sync)
+                verified = {}
+                for row_number, row in enumerate(list(verified_main), start=1):
+                    if len(row) > 6 and str(row[6]).strip():
+                        verified[str(row[6]).strip()] = {
+                            "data": [str(v).strip() for v in row] + [""] * (8 - len(row)),
+                            "sync": (
+                                str(verified_sync_rows[row_number - 1][0]).strip()
+                                if row_number <= len(verified_sync_rows) and verified_sync_rows[row_number - 1]
+                                else ""
+                            ),
+                        }
+                for record in records:
+                    expected = [str(v).strip() for v in record]
+                    found = verified.get(expected[6])
+                    if (
+                        not found
+                        or not found["data"][0]
+                        or found["data"][1:8] != expected[1:8]
+                        or found["sync"] != "DONE"
+                    ):
+                        raise RuntimeError(f"ตรวจสอบข้อมูลหลังบันทึกไม่ผ่าน: {expected[6]}")
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                if "exceeds grid limits" in last_err.lower():
+                    # row_count ใน object ที่ cache อาจเก่าหากมีคนปรับขนาดชีตจากหน้าเว็บ
+                    _get_result_worksheet.clear()
+                    if attempt < max_retries:
+                        continue
+                    return False, last_err
+                if _http_status_code(e) == 429 or "Quota exceeded" in last_err:
+                    # พัก 65 วินาทีให้พ้นรอบโควตารายหนึ่งนาที แล้วปล่อยให้ Pending Sync ตามต่อ
+                    SHEET_COOLDOWN_STATE["until"] = time.monotonic() + 65
+                    return False, last_err
+                if not _is_retryable_error(e):
+                    return False, last_err
+                if attempt < max_retries:
+                    time.sleep(min((2 ** attempt) + (attempt * 0.25), 10))
+    return False, f"พยายามบันทึกแบบ Batch {max_retries} ครั้งแล้วไม่สำเร็จ: {last_err}"
 
 
-def test_429_after_commit_is_idempotent():
-    sheet = MemoryWorksheet(row_count=120, fail_read_at={2})
-    app = load_app_functions(sheet)
-    records = make_records(1)
-    first_ok, first_error = app.write_batch(records)
-    assert not first_ok and ("429" in first_error or "Quota exceeded" in first_error)
-    assert len(sheet.data_rows()) == 6, "Write should have committed before verify read failed"
-    writes_after_commit = sheet.writes
-    app.cooldown["until"] = 0.0
-    retry_ok, retry_error = app.write_batch(records)
-    assert retry_ok, retry_error
-    assert sheet.writes == writes_after_commit, "Retry rewrote an already committed batch"
-    verify_sheet(sheet, records)
-    return {
-        "first_result": "429 after commit", "retry_result": "success",
-        "sheet_rows": len(sheet.data_rows()), "writes": sheet.writes,
-    }
+def _find_receipt_row(worksheet, filename):
+    """หาแถวจากชื่อไฟล์ในคอลัมน์ G; ชื่อไฟล์มี UUID จึงไม่ซ้ำกัน."""
+    cells = worksheet.findall(filename, in_column=7)
+    if not cells:
+        raise LookupError(f"หาแถวของไฟล์ {filename} ไม่พบ")
+    return cells[-1].row
 
 
-def test_exact_duplicate_is_noop():
-    sheet = MemoryWorksheet(row_count=120)
-    app = load_app_functions(sheet)
-    records = make_records(1)
-    first_ok, first_error = app.write_batch(records)
-    assert first_ok, first_error
-    writes_after_first = sheet.writes
-    second_ok, second_error = app.write_batch(records)
-    assert second_ok, second_error
-    assert sheet.writes == writes_after_first
-    verify_sheet(sheet, records)
-    return {"sheet_rows": len(sheet.data_rows()), "writes": sheet.writes}
+def update_receipt_sync(filename, url=None, sync_status=None, max_retries=5):
+    """อัปเดตลิงก์รูป (H) และ/หรือ SyncQueue (O) โดยไม่แตะคอลัมน์สูตร I-L."""
+    last_err = ""
 
+    with SHEET_WRITE_SEMAPHORE:
+        for attempt in range(1, max_retries + 1):
+            try:
+                worksheet = setup_gsheet()
+                row = _find_receipt_row(worksheet, filename)
+                if url is not None:
+                    worksheet.update_cell(row, 8, url)
+                if sync_status is not None:
+                    worksheet.update_cell(row, SYNC_STATUS_COLUMN, sync_status)
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                if not _is_retryable_error(e):
+                    return False, last_err
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 30))
 
-def test_repair_existing_url_and_done():
-    sheet = MemoryWorksheet(row_count=120)
-    records = make_records(1, photo_count=1)
-    sheet.seed_record(records[0], url="", sync_status="")
-    app = load_app_functions(sheet)
-    ok, error = app.write_batch(records)
-    assert ok, error
-    verify_sheet(sheet, records)
-    assert len(sheet.data_rows()) == 1, "Repair created a duplicate row"
-    assert sheet.batch_update_calls == 1, "H and O repair should use one batch update"
-    return {
-        "sheet_rows": len(sheet.data_rows()), "repaired_H": sheet.data_rows()[0][7],
-        "repaired_O": sheet.data_rows()[0][14], "writes": sheet.writes,
-    }
+    return False, f"อัปเดตข้อมูลซิงก์ไม่สำเร็จ: {last_err}"
 
+def fix_orientation(file, thumb_side: int = 500, extra_rotation: int = 0):
+    """เปิดรูป หมุนตาม EXIF ให้ถูกทาง + หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม แล้วย่อเป็นรูปเล็กสำหรับพรีวิว (โหลดเร็ว)"""
+    img = Image.open(file)
+    img = ImageOps.exif_transpose(img)
+    if extra_rotation:
+        img = img.rotate(-extra_rotation, expand=True)
+    img.thumbnail((thumb_side, thumb_side), Image.LANCZOS)
+    return img
 
-def test_conflicting_duplicate_is_rejected():
-    sheet = MemoryWorksheet(row_count=120)
-    original = make_records(1, photo_count=1)
-    sheet.seed_record(original[0], url=original[0][7], sync_status="DONE")
-    conflicting = [list(original[0])]
-    conflicting[0][2] = "different-branch"
-    app = load_app_functions(sheet)
-    ok, error = app.write_batch(conflicting)
-    assert not ok
-    assert "ไม่ตรง" in error
-    verify_sheet(sheet, original)
-    return {"result": "rejected", "error": error}
+def compress_image(file, max_side: int = 1280, quality: int = 78, extra_rotation: int = 0) -> tuple[bytes, int, int]:
+    """
+    ลดขนาดรูปให้ด้านยาวไม่เกิน max_side px แล้ว compress เป็น JPEG
+    คืน (bytes, new_width, new_height)
+    """
+    img = Image.open(file)
+    img = ImageOps.exif_transpose(img)  # หมุนรูปให้ตรงทิศทางจริงตาม EXIF ก่อน compress
+    if extra_rotation:
+        img = img.rotate(-extra_rotation, expand=True)  # หมุนเพิ่มตามที่ผู้ใช้กดปุ่ม
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue(), img.width, img.height
 
-
-def test_error_classification():
-    sheet = MemoryWorksheet()
-    app = load_app_functions(sheet)
-    Timeout = type("Timeout", (Exception,), {})
-    assert app.http_status_code(FakeAPIError(429, "mock")) == 429
-    assert app.is_retryable_error(FakeAPIError(429, "mock"))
-    assert app.is_retryable_error(FakeAPIError(503, "mock"))
-    assert app.is_retryable_error(Timeout("mock"))
-    assert not app.is_retryable_error(FakeAPIError(403, "mock"))
-    assert not app.is_retryable_error(RuntimeError("mock"))
-    return {"429": "retryable", "503": "retryable", "403": "not retryable"}
-
-
-def run_all_tests():
-    cases = [
-        ("happy_5_users_x6", lambda: test_happy_concurrency(5)),
-        ("happy_20_users_x6", lambda: test_happy_concurrency(20)),
-        ("happy_30_users_x6", lambda: test_happy_concurrency(30)),
-        ("read_429_20_users_x6_then_recover", lambda: test_concurrent_429_recovery(20, read_at=11)),
-        ("write_429_30_users_x6_then_recover", lambda: test_concurrent_429_recovery(30, write_at=5)),
-        ("verify_read_429_after_commit", test_429_after_commit_is_idempotent),
-        ("exact_duplicate_noop", test_exact_duplicate_is_noop),
-        ("repair_existing_H_and_O", test_repair_existing_url_and_done),
-        ("conflicting_duplicate_rejected", test_conflicting_duplicate_is_rejected),
-        ("error_classification", test_error_classification),
-    ]
-    failures = []
-    for name, test in cases:
+def upload_to_cloudinary(image_bytes, filename, receipt_data, max_retries=3):
+    """
+    อัพโหลดขึ้น Cloudinary โดยเก็บรวมไว้ในโฟลเดอร์ branch โฟลเดอร์เดียวทั้งหมด
+    """
+    last_error = None
+    expected_public_id = f"branch/{filename}"
+    for attempt in range(1, max_retries + 1):
         try:
-            detail = test()
-            print(f"PASS {name}: {detail}")
-        except Exception as error:
-            failures.append((name, error))
-            print(f"FAIL {name}: {type(error).__name__}: {error}")
-    if failures:
-        raise SystemExit(f"{len(failures)} test(s) failed")
-    print(f"ALL PASS: {len(cases)} scenarios")
+            # จำกัดจำนวน upload พร้อมกันต่อเซิร์ฟเวอร์ (ผู้ใช้ที่เกิน 3 คนจะรอคิว)
+            with CLOUDINARY_UPLOAD_SEMAPHORE:
+                result = cloudinary.uploader.upload(
+                    image_bytes,
+                    folder="branch",
+                    public_id=filename,
+                    resource_type="image",
+                    overwrite=False,
+                    tags=["receipt_sync_pending"],
+                    context=receipt_data,
+                    timeout=60,
+                )
+            if not result.get("secure_url") or not result.get("public_id"):
+                raise RuntimeError("Cloudinary อัปโหลดสำเร็จแต่ไม่ได้คืนลิงก์รูป")
+            return result
+        except Exception as e:
+            last_error = e
+            # กรณี Cloudinary รับรูปแล้วแต่คำตอบกลับหลุด ให้ค้นด้วย public_id เดิมก่อน retry
+            try:
+                recovered = cloudinary.api.resource(
+                    expected_public_id, resource_type="image", context=True
+                )
+                if recovered.get("secure_url") and recovered.get("public_id"):
+                    return recovered
+            except Exception:
+                pass
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"อัปโหลด Cloudinary ไม่สำเร็จหลังลอง {max_retries} ครั้ง: {last_error}")
 
 
-if __name__ == "__main__":
-    run_all_tests()
+def sync_receipt_from_cloudinary(public_id, asset=None):
+    """เขียนรูปที่ติดแท็ก pending กลับเข้า Sheet แล้วปิดงานเมื่อครบทั้งสองฝั่ง."""
+    asset = asset or cloudinary.api.resource(public_id, resource_type="image", context=True)
+    data = asset.get("context", {}).get("custom", {})
+    if not data:
+        # upload response อาจไม่คืน context จึงอ่านข้อมูลจริงจาก Admin API อีกครั้ง
+        asset = cloudinary.api.resource(public_id, resource_type="image", context=True)
+        data = asset.get("context", {}).get("custom", {})
+    required = ("reporter", "branch", "zone", "status", "reason", "filename")
+    missing = [key for key in required if key not in data]
+    if missing:
+        return False, f"รูปไม่มีข้อมูลสำรอง: {', '.join(missing)}"
+
+    sheet_ok, sheet_err = log_batch_to_sheet([[
+        data.get("submitted_at") or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        data["reporter"], data["branch"], data["zone"], data["status"], data["reason"],
+        data["filename"], asset.get("secure_url", ""),
+    ]])
+    if not sheet_ok:
+        return False, sheet_err
+
+    cloudinary.uploader.remove_tag("receipt_sync_pending", [public_id], resource_type="image")
+    return True, ""
+
+
+def _sync_pending_receipts_worker():
+    """งานกู้ Pending ที่ทำใน background เพื่อไม่ให้หน้าเว็บรอ."""
+    try:
+        records = []
+        public_ids = []
+        next_cursor = None
+        pages_checked = 0
+        while len(records) < PENDING_SYNC_BATCH_SIZE and pages_checked < 5:
+            options = {
+                "resource_type": "image",
+                "context": True,
+                "max_results": 50,
+            }
+            if next_cursor:
+                options["next_cursor"] = next_cursor
+            response = cloudinary.api.resources_by_tag("receipt_sync_pending", **options)
+            pages_checked += 1
+            for asset in response.get("resources", []):
+                if len(records) >= PENDING_SYNC_BATCH_SIZE:
+                    break
+                data = asset.get("context", {}).get("custom", {})
+                required = ("reporter", "branch", "zone", "status", "reason", "filename")
+                missing = [key for key in required if key not in data]
+                if missing:
+                    print(
+                        f"PENDING RECEIPT INVALID: {asset.get('public_id', '-')} -> "
+                        f"ไม่มีข้อมูล {', '.join(missing)}"
+                    )
+                    continue
+                records.append([
+                    data.get("submitted_at") or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    data["reporter"], data["branch"], data["zone"], data["status"], data["reason"],
+                    data["filename"], asset.get("secure_url", ""),
+                ])
+                public_ids.append(asset["public_id"])
+            next_cursor = response.get("next_cursor")
+            if not next_cursor:
+                break
+
+        ok, err = log_batch_to_sheet(records)
+        if ok and public_ids:
+            try:
+                cloudinary.uploader.remove_tag(
+                    "receipt_sync_pending", public_ids, resource_type="image"
+                )
+            except Exception as cleanup_error:
+                # ข้อมูลทั้งสองฝั่งครบแล้ว การล้าง tag ล้มเหลวไม่ใช่ข้อมูลสูญหาย
+                print(f"PENDING TAG CLEANUP FAILED: {cleanup_error}")
+        elif not ok:
+            print(f"PENDING RECEIPT BATCH FAILED: {err}")
+    except Exception as e:
+        print(f"PENDING RECEIPT SCAN FAILED: {e}")
+    finally:
+        with PENDING_SYNC_LOCK:
+            PENDING_SYNC_STATE["running"] = False
+
+
+def sync_pending_receipts():
+    """เริ่มกู้ Pending แบบไม่บล็อกหน้าเว็บ และเริ่มได้ครั้งละหนึ่ง worker."""
+    now = time.monotonic()
+    with PENDING_SYNC_LOCK:
+        if PENDING_SYNC_STATE.get("running"):
+            return
+        if now - PENDING_SYNC_STATE["last_run"] < PENDING_SYNC_INTERVAL_SECONDS:
+            return
+        if SHEET_COOLDOWN_STATE["until"] > now:
+            return
+        PENDING_SYNC_STATE["running"] = True
+        PENDING_SYNC_STATE["last_run"] = now
+
+    threading.Thread(
+        target=_sync_pending_receipts_worker,
+        name="receipt-pending-sync",
+        daemon=True,
+    ).start()
+
+
+def delete_from_cloudinary(public_id):
+    """
+    ลบรูปออกจาก Cloudinary (ใช้ตอน rollback เมื่อบันทึกชีทไม่สำเร็จ
+    เพื่อไม่ให้เหลือ "รูปกำพร้า" ที่มีในคลาวแต่ไม่มีในชีท)
+    คืน True ถ้าลบสำเร็จ, False ถ้าลบไม่สำเร็จ (พร้อม print เหตุผลไว้ให้เช็คได้)
+    """
+    try:
+        result = cloudinary.uploader.destroy(public_id, resource_type="image", invalidate=True)
+        # Cloudinary จะตอบ {"result": "ok"} ถ้าลบสำเร็จจริง, "not found" ถ้าไม่เจอไฟล์
+        if result.get("result") != "ok":
+            print(f"CLOUDINARY DELETE FAILED: {public_id} -> {result}")
+            return False
+        return True
+    except Exception as e:
+        print(f"CLOUDINARY DELETE ERROR: {public_id} -> {e}")
+        return False
+
+setup_cloudinary()
+
+if "show_sent_dialog" not in st.session_state:
+    st.session_state.show_sent_dialog = False
+if "sent_count" not in st.session_state:
+    st.session_state.sent_count = 0
+
+sync_pending_receipts()
+
+@st.dialog("✅ ส่งข้อมูลสำเร็จ")
+def show_success_dialog():
+    st.markdown("### คุณส่งแล้ว")
+    st.write(f"อัพโหลดใบเสร็จ {st.session_state.sent_count} รูป และบันทึกข้อมูลเรียบร้อยแล้ว")
+    if st.button("ตกลง", width="stretch"):
+        st.session_state.show_sent_dialog = False
+        st.rerun()
+
+st.markdown("# 🧾 อัพโหลดใบเสร็จ")
+st.markdown('<p class="subtitle">รูปจะถูกส่งเข้า Cloudinary โดยตรง · ปลอดภัย</p>', unsafe_allow_html=True)
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+# ── จำนวนใบเสร็จในรูป ──
+st.markdown("#### 📋 จำนวนใบเสร็จในรูป")
+mode = st.radio("โหมด", ["2 ใบเสร็จ"], label_visibility="collapsed")
+num_receipts = int(mode[0])
+
+
+# ── ชื่อผู้กรอก (พิมพ์เอง) ──
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 🙋 ชื่อผู้กรอก")
+reporter_name = st.text_input(
+    "ชื่อผู้กรอก",
+    placeholder="พิมพ์ชื่อผู้กรอกข้อมูล",
+    label_visibility="collapsed",
+)
+
+# ── เลือกสาขา (พิมพ์ค้นหาชื่อได้) แทนการพิมพ์เอง ──
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 🏢 เลือกสาขา")
+
+branches, branch_err = load_branch_list()
+
+if branch_err:
+    st.markdown(
+        f'<div class="error-box">❌ โหลดรายชื่อสาขาไม่สำเร็จ: {branch_err}<br>'
+        f'ตรวจสอบว่ามี worksheet ชื่อ "รายชื่อสาขา" (หรือชื่อที่ตั้งใน secrets) '
+        f'และมีคอลัมน์หัวตาราง รหัส, รายชื่อสาขา, zone</div>',
+        unsafe_allow_html=True,
+    )
+    sender_name, zone = "", ""
+elif not branches:
+    st.markdown('<div class="error-box">⚠️ ยังไม่มีรายชื่อสาขาในชีท กรุณาเพิ่มข้อมูลก่อนใช้งาน</div>', unsafe_allow_html=True)
+    sender_name, zone = "", ""
+else:
+    # ── ขั้น 1: เลือก Zone ก่อน เพื่อตัดตัวเลือกให้แคบลง ──
+    st.caption("📍 ขั้นที่ 1: เลือก Zone")
+    zone_list = sorted({b["zone"] for b in branches if b["zone"]})
+    zone_options = ["ทั้งหมด (ทุก Zone)"] + zone_list
+    picked_zone = st.selectbox(
+        "เลือก Zone",
+        zone_options,
+        label_visibility="collapsed",
+    )
+
+    if picked_zone == "ทั้งหมด (ทุก Zone)":
+        filtered_branches = branches
+    else:
+        filtered_branches = [b for b in branches if b["zone"] == picked_zone]
+
+    # ── ขั้น 2: พิมพ์ค้นหา/เลือกสาขา จากรายการที่กรองแล้ว (ค้นหาได้ทั้งรหัสและชื่อ) ──
+    def display_label(b):
+        if b["code"]:
+            return f'{b["code"]} | {b["name"]}'
+        return b["name"]
+
+    st.caption(f"🔎 ขั้นที่ 2: พิมพ์รหัสหรือชื่อเพื่อค้นหา/เลือกสาขา ({len(filtered_branches)} สาขา)")
+    branch_options = ["-- กรุณาเลือกสาขา --"] + [display_label(b) for b in filtered_branches]
+    picked = st.selectbox(
+        "เลือกสาขา",
+        branch_options,
+        label_visibility="collapsed",
+        key=f"branch_select_{picked_zone}",
+    )
+
+    if picked != "-- กรุณาเลือกสาขา --":
+        matched = next((b for b in filtered_branches if display_label(b) == picked), None)
+    else:
+        matched = None
+
+    if matched:
+        sender_name = matched["name"]
+        zone = matched["zone"]
+        code_note = f' &nbsp;·&nbsp; รหัส: {matched["code"]}' if matched["code"] else ""
+        st.markdown(
+            f'<div class="branch-box">🏪 <strong>{matched["name"]}</strong> '
+            f'&nbsp;·&nbsp; Zone {matched["zone"] or "-"}{code_note}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        sender_name, zone = "", ""
+
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 📦 เครื่องที่ขาด")
+st.caption("เลือก \"ครบ\" หรือเลือกเครื่องที่ขาดได้หลายเครื่อง (เลือก \"ครบ\" แล้วจะเลือกเครื่องอื่นไม่ได้)")
+
+def _enforce_completeness_exclusive():
+    prev = st.session_state.get("_prev_completeness_sel", [])
+    cur = st.session_state.completeness_sel
+    added = [x for x in cur if x not in prev]
+    if added:
+        new_item = added[0]
+        if new_item == "ครบ":
+            st.session_state.completeness_sel = ["ครบ"]
+        elif "ครบ" in cur:
+            st.session_state.completeness_sel = [x for x in cur if x != "ครบ"]
+    st.session_state["_prev_completeness_sel"] = st.session_state.completeness_sel
+
+completeness_sel = st.multiselect(
+    "เครื่องที่ขาด",
+    ["ครบ", "ขาดเครื่องที่ 1", "ขาดเครื่องที่ 2", "ขาดเครื่องที่ 3", "ขาดเครื่องที่ 4"],
+    label_visibility="collapsed",
+    key="completeness_sel",
+    on_change=_enforce_completeness_exclusive,
+)
+
+if "ครบ" in completeness_sel:
+    completeness = "ครบ"
+elif completeness_sel:
+    completeness = "ไม่ครบ"
+else:
+    completeness = "-- กรุณาเลือก --"
+
+incomplete_reason = ", ".join([x for x in completeness_sel if x != "ครบ"])
+
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown("#### 📷 เลือกรูปภาพ (เลือกได้หลายรูปพร้อมกัน)")
+st.caption("💡 กด Ctrl ค้างไว้แล้วคลิกเลือกหลายรูปพร้อมกัน")
+
+uploaded_files = st.file_uploader(
+    "เลือกไฟล์",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+)
+
+if uploaded_files:
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+    st.markdown(f"#### 🔍 ตรวจสอบรูปก่อนส่ง ({len(uploaded_files)} รูป)")
+
+    st.markdown(
+        '<div class="guide-box">'
+        '📸 <strong>โปรดถ่ายบิลให้ถูกต้อง</strong><br>'
+        '<br><br>'
+        '1. ภาพชัดให้อ่านค่าได้<br>'
+        '2. มีระยะห่างจากกันระหว่างบิล<br>'
+        '3. ภาพเป็นแนวตั้ง (หากเป็นแนวนอนสามารถปรับหมุนได้)<br>'
+        '<br>'
+        '⏳ <strong>โปรดรอจนกว่าจะขึ้น “ส่งข้อมูลสำเร็จ” ก่อนปิดหน้าเว็บ</strong><br><br>'
+
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if "rotations" not in st.session_state:
+        st.session_state.rotations = {}
+
+    for i, f in enumerate(uploaded_files):
+        rot_key = f"{f.name}_{f.size}_{i}"
+        current_rot = st.session_state.rotations.get(rot_key, 0)
+        preview_img = fix_orientation(f, thumb_side=1000, extra_rotation=current_rot)
+        st.image(preview_img, caption=f.name, width="stretch")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("↺ หมุนซ้าย", key=f"rotate_left_{rot_key}", width="stretch"):
+                st.session_state.rotations[rot_key] = (current_rot - 90) % 360
+                st.rerun()
+        with c2:
+            if st.button("↻ หมุนขวา", key=f"rotate_right_{rot_key}", width="stretch"):
+                st.session_state.rotations[rot_key] = (current_rot + 90) % 360
+                st.rerun()
+        with c3:
+            if st.button("🔃 กลับหัว", key=f"rotate_flip_{rot_key}", width="stretch"):
+                st.session_state.rotations[rot_key] = (current_rot + 180) % 360
+                st.rerun()
+
+        st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    st.info(f"จะบันทึกในโฟลเดอร์ branch ทั้ง {len(uploaded_files)} รูป")
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    submit_clicked = st.button(f"☁️ อัพโหลดทั้งหมด ({len(uploaded_files)} รูป)")
+
+    if submit_clicked:
+        missing = []
+        if not reporter_name.strip():
+            missing.append("ชื่อผู้กรอก")
+        if not sender_name.strip():
+            missing.append("สาขา (กรุณาเลือกจากรายการ)")
+        if completeness == "-- กรุณาเลือก --":
+            missing.append("เครื่องที่ขาด")
+        if completeness == "ไม่ครบ" and not incomplete_reason.strip():
+            missing.append("เครื่องที่ขาด (เลือกอย่างน้อย 1 เครื่อง)")
+
+        # ── กันกดส่งซ้ำเร็วเกินไป (เช่น กดรัวๆ ระหว่างที่กำลังประมวลผลอยู่) ──
+        now = datetime.datetime.now()
+        last_click = st.session_state.get("last_upload_click_time")
+        if not missing and last_click and (now - last_click).total_seconds() < 5:
+            st.markdown(
+                '<div class="error-box">⏳ ระบบกำลังประมวลผลรายการก่อนหน้าอยู่ กรุณารอสักครู่ก่อนกดส่งใหม่</div>',
+                unsafe_allow_html=True,
+            )
+            missing = ["__debounce__"]  # กันไม่ให้ทำงานต่อในรอบนี้
+
+        if missing:
+            if missing != ["__debounce__"]:
+                items = "".join([f"<br>• {m}" for m in missing])
+                st.markdown(f'<div class="error-box">⚠️ กรุณากรอกข้อมูลให้ครบก่อนอัพโหลด:{items}</div>', unsafe_allow_html=True)
+        else:
+            st.session_state.last_upload_click_time = now
+
+            safe_sender = sender_name.strip().replace("/", "-").replace("\\", "-")
+            results = []
+            batch_rows = []
+            uploaded_assets = []
+            prog = st.progress(0, text="กำลังอัพโหลด...")
+
+            for idx, f in enumerate(uploaded_files):
+                try:
+                    # ── compress: max 1280px ด้านยาว, quality 78 + หมุนตามที่ผู้ใช้เลือก ──
+                    f.seek(0)  # รีเซ็ตตำแหน่งไฟล์ เพราะพรีวิวด้านบนอ่านไปแล้ว
+                    rot_key = f"{f.name}_{f.size}_{idx}"
+                    extra_rot = st.session_state.get("rotations", {}).get(rot_key, 0)
+                    with IMAGE_PROCESS_SEMAPHORE:
+                        img_bytes, new_w, new_h = compress_image(
+                            f, max_side=1280, quality=78, extra_rotation=extra_rot
+                        )
+
+                    status_label = "ครบ" if completeness == "ครบ" else "ไม่ครบ"
+                    # เวลาอย่างเดียว (ความละเอียดเป็นวินาที) ชนกันได้เมื่อมีผู้ใช้งานพร้อมกัน
+                    # จึงใส่ UUID ลงในชื่อไฟล์และใช้ชื่อเดียวกันตลอดทั้ง Cloudinary/Sheet
+                    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    receipt_id = uuid.uuid4().hex
+                    fname = f"{safe_sender}_{ts_file}_{idx+1}_{receipt_id[:12]}"
+                    sheet_filename = f"{fname}.jpg"
+
+                    # อัปโหลดรูปพร้อมข้อมูลสำรองก่อน เพื่อรักษารูปไว้แม้ Sheet ขัดข้อง
+                    receipt_data = {
+                        "receipt_id": receipt_id,
+                        "submitted_at": datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                        "reporter": reporter_name.strip(),
+                        "branch": sender_name.strip(),
+                        "zone": zone.strip(),
+                        "status": status_label,
+                        "reason": incomplete_reason.strip() or "-",
+                        "filename": sheet_filename,
+                    }
+                    upload_result = upload_to_cloudinary(img_bytes, fname, receipt_data)
+                    batch_rows.append([
+                        receipt_data["submitted_at"],
+                        receipt_data["reporter"], receipt_data["branch"], receipt_data["zone"],
+                        receipt_data["status"], receipt_data["reason"], receipt_data["filename"],
+                        upload_result.get("secure_url", ""),
+                    ])
+                    uploaded_assets.append({
+                        "public_id": upload_result["public_id"], "filename": fname,
+                        "size_kb": round(len(img_bytes) / 1024), "dim": f"{new_w}×{new_h}",
+                    })
+                except Exception as e:
+                    results.append({"filename": f.name, "ok": False, "stored": False, "detail": str(e)})
+
+                prog.progress((idx+1)/len(uploaded_files), text=f"อัพโหลด {idx+1}/{len(uploaded_files)}...")
+
+            prog.empty()
+            # หลังอัปโหลดรูปครบแล้ว เขียนข้อมูลทุกแถวลง Sheet พร้อมกันครั้งเดียว
+            batch_ok, batch_err = log_batch_to_sheet(batch_rows)
+            if batch_ok:
+                public_ids = [asset["public_id"] for asset in uploaded_assets]
+                if public_ids:
+                    try:
+                        # ล้าง tag ของทุกรูปใน API call เดียว; ถ้าล้างไม่ผ่านข้อมูลยังครบทั้งสองฝั่ง
+                        cloudinary.uploader.remove_tag(
+                            "receipt_sync_pending", public_ids, resource_type="image"
+                        )
+                    except Exception as cleanup_error:
+                        print(f"PENDING TAG CLEANUP FAILED: {cleanup_error}")
+                for asset in uploaded_assets:
+                    results.append({"filename": asset["filename"], "ok": True,
+                                    "size_kb": asset["size_kb"], "dim": asset["dim"]})
+            else:
+                for asset in uploaded_assets:
+                    print(f"PENDING RECEIPT: {asset['public_id']} -> {batch_err}")
+                    results.append({"filename": asset["filename"], "ok": False, "stored": True,
+                                    "detail": f"เก็บรูปแล้ว แต่ sync Google Sheet ยังไม่สำเร็จ: {batch_err}"})
+
+            ok   = [r for r in results if r["ok"]]
+            fail = [r for r in results if not r["ok"]]
+
+            if ok:
+                lines = [f"<strong>✅ อัพโหลดสำเร็จ {len(ok)} รูป!</strong>"]
+                for r in ok:
+                    lines.append(f"📄 {r['filename']}.jpg &nbsp;·&nbsp; {r['dim']} px &nbsp;·&nbsp; {r['size_kb']} KB")
+                st.markdown(f'<div class="success-box">{"<br>".join(lines)}</div>', unsafe_allow_html=True)
+
+            if fail:
+                # ไม่โชว์รายละเอียด error ทางเทคนิคให้ผู้ใช้ทั่วไปเห็น (สับสน/ไม่มีประโยชน์กับเขา)
+                # แต่พิมพ์เก็บไว้ใน log ฝั่งเซิร์ฟเวอร์ให้เจ้าของระบบตามดูได้
+                for r in fail:
+                    print(f"UPLOAD FAILED: {r['filename']} — {r.get('detail', '')}")
+
+                pending = [r for r in fail if r.get("stored")]
+                not_stored = [r for r in fail if not r.get("stored")]
+                messages = []
+                if pending:
+                    messages.append(
+                        f'<strong>⏳ เก็บรูปไว้แล้ว {len(pending)} รูป</strong>'
+                        f'<br>ระบบจะลองบันทึกลง Google Sheet เมื่อแอปทำงานรอบถัดไป'
+                        f'<br>กรุณาอย่ากดส่งรูปเหล่านี้ซ้ำ'
+                    )
+                if not_stored:
+                    messages.append(
+                        f'<strong>❌ รูปที่ยังเก็บไม่สำเร็จ {len(not_stored)} รูป</strong>'
+                        f'<br>กรุณาเลือกเฉพาะรูปดังกล่าวแล้วส่งใหม่'
+                    )
+                st.markdown(
+                    f'<div class="error-box">{"<br><br>".join(messages)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if ok and not fail:
+                st.session_state.show_sent_dialog = True
+                st.session_state.sent_count = len(ok)
+                st.rerun()
+
+if st.session_state.show_sent_dialog:
+    show_success_dialog()
+
+st.markdown('<hr class="divider">', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#d1d5db;font-size:0.8rem;">รูปทั้งหมดจะถูกส่งเข้าบัญชี Cloudinary ของเจ้าของระบบเท่านั้น</p>', unsafe_allow_html=True)
